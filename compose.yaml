@@ -1,0 +1,94 @@
+# wabgpt self-hosted single-user server.
+#
+#   docker compose pull browseros
+#   docker compose build wabgpt
+#   docker compose up -d --wait
+#
+# Published ports (both on the host loopback only):
+#   127.0.0.1:8788  wabgpt owner dashboard (login with the owner token)
+#   127.0.0.1:6080  BrowserOS Neo noVNC viewer (NO authentication)
+#
+# NOT published: BrowserOS MCP (9010). The wabgpt container joins the browseros
+# container's network namespace, so wabgpt reaches MCP at 127.0.0.1:9010
+# without Docker ever mapping that port to the host.
+#
+# Keep the "127.0.0.1:" prefix. Without it Docker publishes on every
+# interface and, on Linux, bypasses host firewalls such as ufw. Neither the
+# noVNC viewer nor the MCP server asks for a password: whoever reaches them
+# controls a browser signed in to your accounts. Reach the ports over SSH or a
+# private VPN; see docs/deployment.md.
+name: wabgpt
+
+services:
+  browseros:
+    # Official upstream image, fetched straight from its publisher. Pinned to
+    # the multi-arch index digest (linux/amd64 and linux/arm64). To update,
+    # pick a newer digest from https://github.com/browseros-ai/BrowserOS and
+    # review upstream's changes first.
+    image: ghcr.io/browseros-ai/neo@sha256:6b8939714b29538cb52765397cf14cbfbf71933732de19a350de1d268c51644d
+    hostname: neo
+    init: false # the image runs tini itself
+    shm_size: 1g # Chromium crashes ("Aw, Snap!") with Docker's 64 MB default
+    stop_grace_period: 20s # time for Neo to flush cookies on shutdown
+    restart: unless-stopped
+    # The image defines its own HEALTHCHECK (neo-healthcheck); it is inherited
+    # unchanged and wabgpt waits on it below.
+    ports:
+      - "127.0.0.1:8788:8788" # wabgpt dashboard (served by the wabgpt container)
+      - "127.0.0.1:6080:6080" # noVNC viewer, unauthenticated: loopback only
+    volumes:
+      # Fresh, isolated, persistent profile: Linux Chromium cannot read cookies
+      # from a macOS/Windows desktop profile, and this must never be that one.
+      - browseros-data:/data
+      # Hosted mode disables automatic tab groups; wabgpt needs them.
+      - ./deploy/neo.toml:/etc/neo/neo.toml:ro
+    environment:
+      # Upstream's documented defaults, stated so they are visible here.
+      PUID: "1000"
+      PGID: "1000"
+      BROWSERCLAW_HOSTED_MODE: "1"
+      # Upstream default is false: Chromium runs with --no-sandbox because
+      # Docker's default seccomp profile blocks user namespaces. We do not loosen
+      # host security (no seccomp/apparmor=unconfined, no privileged mode) to
+      # change that. See docs/deployment.md#browser-sandbox.
+
+  wabgpt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wabgpt:local
+    # Share browseros' network namespace: MCP stays 127.0.0.1:9010 inside it,
+    # and the dashboard port published above is this container's 8788.
+    network_mode: "service:browseros"
+    depends_on:
+      browseros:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s # drains an in-progress browser operation
+    user: "1000:1000" # the image's non-root "node" user
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # WhatsApp credentials, routing state, owner token, lock file.
+      - wabgpt-data:/data
+      - ./deploy/config.json:/etc/wabgpt/config.json:ro
+    healthcheck:
+      # The login page is public and contains no private data.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8788/').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  browseros-data:
+  wabgpt-data:

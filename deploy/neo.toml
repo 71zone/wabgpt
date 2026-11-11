@@ -1,0 +1,8 @@
+# BrowserOS Neo settings for the wabgpt Compose deployment.
+# Mounted read-only at /etc/neo/neo.toml in the browseros container.
+#
+# The official image runs in "hosted mode", which turns automatic tab groups
+# off. wabgpt keeps its ChatGPT delivery tab inside a tab group and reuses it
+# after an MCP session expires, so grouping has to be on.
+[tabs]
+grouping = "auto"

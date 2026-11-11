@@ -1,0 +1,34 @@
+# Opt-in override: run wabgpt against a BrowserOS that already runs on the HOST
+# (the native BrowserOS app, MCP at 127.0.0.1:9010), instead of the bundled
+# browseros container. Layer it over compose.yaml; start ONLY wabgpt:
+#
+#   docker compose -f compose.yaml -f compose.host-browser.yaml up -d --build --wait wabgpt
+#
+# Requires Docker Compose v2.24.4+ (the `!reset` tag below) and host networking:
+# Linux Docker Engine, OrbStack, or Docker Desktop 4.34+ with
+# "Enable host networking" turned on.
+#
+# wabgpt joins the host network namespace, so 127.0.0.1:9010 is the host's
+# BrowserOS MCP. The MCP port is not published and no policy exception is made
+# for it. The dashboard listens on 127.0.0.1:8788 of the host
+# (deploy/config.host-browser.json sets server.host explicitly; with host
+# networking the default 0.0.0.0 would expose it on every interface).
+#
+# This mode and the bundled mode share the same project and wabgpt-data volume,
+# so run only one at a time. To switch, stop first, then start the other:
+#
+#   docker compose stop
+#   docker compose up -d --wait                  # bundled BrowserOS (default)
+#   docker compose -f compose.yaml -f compose.host-browser.yaml up -d --wait wabgpt
+#
+# Never use `docker compose down -v`: it deletes the WhatsApp session volume.
+services:
+  wabgpt:
+    network_mode: host
+    # Drop the dependency on the bundled browseros service. Without `!reset`,
+    # Compose merges maps and the base `depends_on: browseros` would survive.
+    depends_on: !reset {}
+    volumes:
+      # Same container path as in compose.yaml, so this replaces that mount.
+      # The wabgpt-data volume mount is inherited unchanged.
+      - ./deploy/config.host-browser.json:/etc/wabgpt/config.json:ro

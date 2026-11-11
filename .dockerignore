@@ -1,0 +1,27 @@
+# Allowlist build context: exclude everything, then add only what the build needs.
+*
+
+!package.json
+!package-lock.json
+!tsconfig.json
+!scripts/
+!tsconfig.build.json
+!src/
+!web/
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!licenses/
+!deploy/config.json
+
+# Tests, local data and caches inside allowed directories never enter the image.
+**/*.test.ts
+**/node_modules
+**/.wa-chatgpt
+**/state.json
+**/creds.json
+**/bridge.lock
+**/onboarding.json*
+**/.*.config.tmp
+**/server-token*
+**/.env*
+**/.DS_Store

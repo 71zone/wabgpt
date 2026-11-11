@@ -1,0 +1,52 @@
+name: CI
+
+# Verification only. This workflow never publishes an npm package, a container
+# image or a release; publishing needs a separate, explicit decision (see
+# THIRD_PARTY_NOTICES.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  docker:
+    name: Docker build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose file (bundled BrowserOS)
+        run: docker compose config --quiet
+      - name: Validate Compose file (host BrowserOS override)
+        run: docker compose -f compose.yaml -f compose.host-browser.yaml config --quiet
+      - name: Build application image
+        run: docker compose build wabgpt
+      - name: Image runs as a non-root user and ships licence files
+        run: |
+          test "$(docker run --rm --entrypoint id wabgpt:local -u)" != "0"
+          docker run --rm --entrypoint test wabgpt:local -f /usr/share/doc/wabgpt/THIRD_PARTY_NOTICES.md
+          docker run --rm --entrypoint test wabgpt:local -f /usr/share/doc/wabgpt/licenses/libsignal-GPL-3.0.txt

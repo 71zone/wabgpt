@@ -1,0 +1,9 @@
+{
+  "browserMcpUrl": "http://127.0.0.1:9010/mcp",
+  "dataDir": "/data",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8788,
+    "tokenFile": "/data/server-token"
+  }
+}

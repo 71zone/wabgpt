@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>wabgpt owner dashboard</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main id="login" hidden>
+    <h1>wabgpt</h1>
+    <p class="muted">Owner sign-in. Paste the owner token printed by <code>wabgpt token</code>.</p>
+    <form id="login-form" autocomplete="off">
+      <label for="login-token">Owner token</label>
+      <input id="login-token" name="owner-token" type="password" autocomplete="off" spellcheck="false" required maxlength="256">
+      <button id="login-submit" type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert" hidden></p>
+    </form>
+  </main>
+
+  <div id="dashboard" hidden>
+    <header class="bar">
+      <h1>wabgpt</h1>
+      <span id="app-names" class="muted"></span>
+      <span id="connection" class="chip" data-state="connecting">Connecting…</span>
+      <button id="btn-logout" type="button">Sign out</button>
+    </header>
+
+    <section id="status" class="panel" aria-label="Connections">
+      <div class="statuses">
+        <div><span class="label" id="channel-label">Channel</span><span id="channel-status" class="chip">—</span></div>
+        <div><span class="label" id="assistant-label">Assistant</span><span id="assistant-status" class="chip">—</span></div>
+        <div><span class="label">Forwarding</span><span id="forwarding-status" class="chip">—</span></div>
+        <div><span class="label">Enabled</span><span id="enabled-count" class="chip">0</span></div>
+      </div>
+      <div class="actions">
+        <button id="btn-connect" type="button">Connect</button>
+        <button id="btn-browser" type="button">Check browser</button>
+        <button id="btn-resume" type="button">Resume forwarding</button>
+        <button id="btn-pause" type="button">Pause all</button>
+      </div>
+      <p id="sharing-warning" class="muted"></p>
+      <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+    </section>
+
+    <section id="qr-panel" class="panel" hidden aria-label="Pairing code">
+      <h2>Link a device</h2>
+      <p id="qr-help" class="muted"></p>
+      <img id="qr-image" alt="Pairing QR code" width="320" height="320">
+    </section>
+
+    <div class="columns">
+      <section id="directory" class="panel" aria-label="Contacts">
+        <h2>Contacts</h2>
+        <form id="add-form" class="row" autocomplete="off">
+          <label class="sr-only" for="add-input">Contact number or address</label>
+          <input id="add-input" type="text" maxlength="128" placeholder="Contact number or address" spellcheck="false" autocapitalize="off">
+          <button id="add-submit" type="submit">Add and enable</button>
+        </form>
+        <div class="row">
+          <label class="sr-only" for="contact-search">Search contacts</label>
+          <input id="contact-search" type="search" placeholder="Search contacts" autocomplete="off">
+          <label class="sr-only" for="contact-filter">Filter</label>
+          <select id="contact-filter">
+            <option value="all">All</option>
+            <option value="enabled">Enabled</option>
+            <option value="contacts">Contacts</option>
+            <option value="chats">Recent chats</option>
+          </select>
+        </div>
+        <ul id="contact-list" class="contacts"></ul>
+        <p id="contact-empty" class="muted" hidden>No contacts match.</p>
+      </section>
+
+      <section id="detail" class="panel" aria-label="Selected contact">
+        <h2>Selected contact</h2>
+        <p id="detail-empty" class="muted">Select a contact to configure it.</p>
+        <div id="detail-body" hidden>
+          <p><strong id="detail-name"></strong> <span id="detail-state" class="chip"></span></p>
+          <p id="detail-id" class="muted mono"></p>
+          <p id="detail-error" class="error" hidden></p>
+          <p id="detail-conversation" class="muted"></p>
+          <div class="row">
+            <button id="detail-toggle" type="button">Enable</button>
+          </div>
+
+          <h3>Project</h3>
+          <div class="row">
+            <label class="sr-only" for="project-select">Project</label>
+            <select id="project-select"></select>
+            <button id="project-refresh" type="button">Refresh projects</button>
+            <button id="project-save" type="button">Assign</button>
+          </div>
+          <p id="project-note" class="muted"></p>
+
+          <h3>Conversation lifetime</h3>
+          <form id="ttl-form" class="row" autocomplete="off">
+            <label class="sr-only" for="ttl-input">Lifetime</label>
+            <input id="ttl-input" type="text" maxlength="32" placeholder="24h" spellcheck="false">
+            <button id="ttl-save" type="submit">Save</button>
+          </form>
+          <p class="muted">Examples: 90m, 12h, 3d, never. Empty means 24h. Fixed from the first saved conversation; checked at the next message.</p>
+        </div>
+      </section>
+    </div>
+
+    <section id="activity" class="panel" aria-label="Activity">
+      <h2>Activity</h2>
+      <ol id="activity-log" class="log"></ol>
+    </section>
+  </div>
+</body>
+</html>

@@ -1,0 +1,67 @@
+{
+  "name": "whatsapp-chatgpt-bridge",
+  "version": "1.0.0",
+  "description": "Self-hosted single-user bridge that forwards WhatsApp chats to ChatGPT through a local BrowserOS Neo browser, with a terminal dashboard and an owner web dashboard.",
+  "license": "MIT",
+  "author": "wabgpt contributors",
+  "keywords": [
+    "whatsapp",
+    "chatgpt",
+    "browseros",
+    "mcp",
+    "self-hosted"
+  ],
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "wabgpt": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "web",
+    "deploy/neo.toml",
+    "docs",
+    "licenses",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepare": "npm run build",
+    "start": "tsx src/cli.ts",
+    "check": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "blessed": "^0.1.81",
+    "pino": "^10.0.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/blessed": "^0.1.27",
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/qrcode-terminal": "^0.12.2",
+    "linkedom": "^0.18.15",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.0"
+  }
+}

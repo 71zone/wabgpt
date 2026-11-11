@@ -1,0 +1,66 @@
+# Dependencies and build output
+node_modules/
+dist.tmp/
+dist/
+*.tsbuildinfo
+*.tgz
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment files (the app needs none, but never commit them)
+.env
+.env.*
+!.env.example
+
+# wabgpt runtime data: WhatsApp credentials, routing state, locks, tokens.
+# The default location is ~/.wa-chatgpt, outside the checkout. These patterns
+# protect you if you point dataDir inside the repository. Directory names are
+# anchored to the repository root so source folders such as
+# src/adapters/whatsapp/ stay tracked.
+.wa-chatgpt/
+**/.wa-chatgpt/
+/whatsapp/
+/auth/
+/auth_info*/
+/data/
+creds.json
+state.json
+state.json.*
+contacts.json
+bridge.lock
+server-token
+server-token.*
+# First-run setup progress (onboarding.json.* covers its atomic temp file) and
+# the temporary file a config rewrite leaves behind if interrupted.
+onboarding.json
+onboarding.json.*
+.*.config.tmp
+.bridge/
+
+# Local config copies (deploy/config.json is the one secret-free tracked config)
+/config.json
+*.local.json
+
+# BrowserOS / Chromium profiles and Docker bind-mount data
+/neo-data/
+/browseros-data/
+/profile/
+/user-data/
+/runtime/
+
+# Backups and archives of any of the above
+/backup/
+/backups/
+*.bak
+*.backup
+*.tar
+*.tar.gz
+*.tar.zst
+wabgpt-*.tar*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
