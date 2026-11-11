@@ -16,7 +16,7 @@
 # interface and, on Linux, bypasses host firewalls such as ufw. Neither the
 # noVNC viewer nor the MCP server asks for a password: whoever reaches them
 # controls a browser signed in to your accounts. Reach the ports over SSH or a
-# private VPN; see docs/deployment.md.
+# private VPN; see docs/guides/docker-compose.md.
 name: wabgpt
 
 services:
@@ -50,7 +50,7 @@ services:
       # Upstream default is false: Chromium runs with --no-sandbox because
       # Docker's default seccomp profile blocks user namespaces. We do not loosen
       # host security (no seccomp/apparmor=unconfined, no privileged mode) to
-      # change that. See docs/deployment.md#browser-sandbox.
+      # change that. See docs/guides/docker-compose.md#browser-sandbox.
 
   wabgpt:
     build:

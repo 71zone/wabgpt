@@ -2,7 +2,7 @@
 #
 # wabgpt application image (WhatsApp <-> ChatGPT bridge, owner dashboard).
 # BrowserOS Neo is NOT part of this image: Compose pulls the official upstream
-# image separately. See compose.yaml and docs/deployment.md.
+# image separately. See compose.yaml and docs/guides/docker-compose.md.
 #
 #   docker compose build wabgpt
 

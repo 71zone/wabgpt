@@ -1,11 +1,19 @@
+---
+type: Guide
+title: Extending wabgpt
+description: Add a messaging channel, assistant, storage or frontend by implementing a small interface and changing one composition point.
+---
+
 # Extending wabgpt
 
 wabgpt separates a provider-neutral core from concrete adapters and frontends. You extend it by implementing a small interface and changing one composition point. There is no plugin registry, no dynamic loading and no configuration-driven provider selection; that is deliberate for a single-owner tool.
 
+For the behavior these interfaces carry, see [delivery](../concepts/delivery.md) and [conversations](../concepts/conversations.md). For project verification expectations, see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+
 ## Layout and dependency rule
 
 ```
-src/core/            contracts.ts  application.ts  bridge.ts  state.ts  duration.ts
+src/core/            contracts.ts  application.ts  bridge.ts  state.ts  duration.ts  single-flight.ts
 src/adapters/
   storage/           json-state.ts            StatePersistence on the filesystem
   whatsapp/          whatsapp.ts (factory), directory.ts, inbound/lifecycle helpers
@@ -22,11 +30,13 @@ src/serve.ts         server lifecycle: serve, restore after subscribe, stop serv
 src/index.ts         supported programmatic exports
 ```
 
-Rule: `src/core` imports nothing from adapters, the filesystem, config, Baileys, BrowserOS or any presentation code. Frontends talk to `Application`, never to concrete providers. Only `bootstrap.ts` knows which concrete adapters exist.
+Key files: [`contracts.ts`](../../src/core/contracts.ts), [`application.ts`](../../src/core/application.ts), [`state.ts`](../../src/core/state.ts), [`bootstrap.ts`](../../src/bootstrap.ts), [`serve.ts`](../../src/serve.ts) and [`index.ts`](../../src/index.ts).
+
+Rule: `src/core` imports nothing from adapters, the filesystem, config, Baileys, BrowserOS or any presentation code. Frontends talk to `Application`, never to concrete providers. Only [`bootstrap.ts`](../../src/bootstrap.ts) knows which concrete adapters exist.
 
 ## The contracts
 
-Defined in `src/core/contracts.ts`:
+Defined in [`src/core/contracts.ts`](../../src/core/contracts.ts) (doc comments omitted here):
 
 ```ts
 export type Logger = (message: string) => void;
@@ -73,7 +83,7 @@ export interface AssistantAdapter {
 
 These are what the core's guarantees rest on. Tests in `tests/` exercise the existing adapters against them.
 
-- **Opaque ids and references.** The core stores `Contact.id`, `Project.ref` and conversation refs as strings and never parses them. Validation and canonicalization belong to the adapter's `AssistantReferencePolicy`. `tests/support/core-fixtures.ts` has `opaqueReferences`, a deliberately non-URL scheme used to prove the core does not interpret references.
+- **Opaque ids and references.** The core stores `Contact.id`, `Project.ref` and conversation refs as strings and never parses them. Validation and canonicalization belong to the adapter's `AssistantReferencePolicy`. [`tests/support/core-fixtures.ts`](../../tests/support/core-fixtures.ts) has `opaqueReferences`, a deliberately non-URL scheme used to prove the core does not interpret references.
 - **Stable identity.** The same contact must always produce the same `id`. If a provider knows two ids for one person, report them through `identities()` / the identity callback as `{ alias, canonical }`; delivery keys and routes then merge by canonical id.
 - **No message bodies at rest.** The core persists ids, names, references and delivery status, not text. Do not add body logging or persistence.
 - **No replay of uncertain work.** `reply()` must throw if it cannot tell whether the prompt was accepted. The bridge pauses that route and never resubmits. Call `onConversation(ref)` as soon as a conversation reference exists so the core can persist it, and `onSubmitted()` only after the assistant has actually accepted the prompt: that is what triggers the read receipt.
@@ -137,7 +147,7 @@ export function createEcho(): AssistantAdapter {
 }
 ```
 
-Wire it by replacing the assistant in `src/bootstrap.ts`:
+Wire it by replacing the assistant in [`src/bootstrap.ts`](../../src/bootstrap.ts):
 
 ```ts
 import { createEcho } from './adapters/echo/echo.js';
@@ -159,7 +169,7 @@ const application = new Application(
 );
 ```
 
-`createApplication(config)` in `bootstrap.ts` does exactly this for the real providers and returns an unstarted `Application`. `openRuntime(config, options?)` additionally sets `umask 077`, takes the data directory's single-writer lock (`bridge.lock`) for the process lifetime, routes dependency console output into the application log, and returns `{ application, close() }`. Its optional `prepare(config)` hook runs after the lock is held and before any provider exists, and returns the config the `Application` is built from; the terminal's first-run setup uses it to choose the BrowserOS endpoint (including starting the managed Docker browser) before the assistant adapter is created. If `prepare` throws, the lock is released and the console restored before the error propagates. Every frontend must go through `openRuntime`: two writers on one credential directory corrupt WhatsApp sessions. If you embed `Application` from `src/index.ts` instead, you are responsible for holding an equivalent lock.
+`createApplication(config)` in [`bootstrap.ts`](../../src/bootstrap.ts) does exactly this for the real providers and returns an unstarted `Application`. `openRuntime(config, options?)` additionally sets `umask 077`, takes the data directory's single-writer lock (`bridge.lock`) for the process lifetime, routes dependency console output into the application log, and returns `{ application, close() }`. Its optional `prepare(config)` hook runs after the lock is held and before any provider exists, and returns the config the `Application` is built from; the terminal's first-run setup uses it to choose the BrowserOS endpoint (including starting the [managed Docker browser](managed-browser.md)) before the assistant adapter is created. If `prepare` throws, the lock is released and the console restored before the error propagates. Every frontend must go through `openRuntime`: two writers on one credential directory corrupt WhatsApp sessions. If you embed `Application` from [`src/index.ts`](../../src/index.ts) instead, you are responsible for holding an equivalent lock.
 
 Message callbacks flow from the adapter to the application: `application.receive(incoming)`, `application.setChannelStatus(status)`, `application.linkIdentity(alias)`, and `application.emit('qr', rawPayload)` for pairing codes (the raw payload string; each frontend renders it).
 
@@ -178,7 +188,7 @@ interface StatePersistence {
 }
 ```
 
-`RoutingState.load(persistence, references)` validates what `read()` returns and migrates the legacy v1 document to the current v2 schema in memory; nothing is written until validation succeeds. `createJsonStatePersistence(dataDir)` is the filesystem implementation (directory mode 0700, file mode 0600, temp file plus rename). When its first write replaces a document of a different schema version, it first copies the old document to `state.json.v<version>.bak` (mode 0600, never overwritten), so an upgraded v1 file is kept as `state.json.v1.bak` and a downgrade stays possible. A replacement must keep writes private and atomic, and must serialize concurrent writes. Business rules (unique project ownership, TTL, delivery journal) stay in `RoutingState`; do not reimplement them in an adapter.
+`RoutingState.load(persistence, references)` validates what `read()` returns and migrates the legacy v1 document to the current v2 schema in memory; nothing is written until validation succeeds. `createJsonStatePersistence(dataDir)` is the filesystem implementation (directory mode 0700, file mode 0600, temp file plus rename). When its first write replaces a document of a different schema version, it first copies the old document to `state.json.v<version>.bak` (mode 0600, never overwritten), so an upgraded v1 file is kept as `state.json.v1.bak` and a downgrade stays possible. A replacement must keep writes private and atomic, and must serialize concurrent writes. Business rules (unique project ownership, TTL, delivery journal) stay in `RoutingState`; do not reimplement them in an adapter. See [local data](../reference/local-data.md) for what the default implementation stores.
 
 ## Adding a frontend
 
@@ -186,14 +196,14 @@ Depend only on `Application`:
 
 - Read `application.snapshot()` (`routes`, `contacts`, `directory`, `chats`, `armed`, `channelStatus`, `assistantStatus`).
 - Subscribe to `change`, `log` and `qr` events and remove listeners on shutdown.
-- Mutate through `login()`, `checkBrowser()`, `resume()`, `pause()`, `toggle(contact)`, `setContactEnabled(contact, boolean)`, `resolveContact(input)` (non-mutating lookup; it never enables or saves anything), `addContact(input)` (resolves, then enables), `listProjects(signal?)`, `setProject(contact, ref | null)`, `setConversationTtl(contact, minutes | null)` and `close()`. `parseConversationTtl` / `formatConversationTtl` in `core/duration.ts` are shared by the TUI and HTTP frontends.
+- Mutate through `login()`, `checkBrowser()`, `resume()`, `pause()`, `toggle(contact)`, `setContactEnabled(contact, boolean)`, `resolveContact(input)` (non-mutating lookup; it never enables or saves anything), `addContact(input)` (resolves, then enables), `listProjects(signal?)`, `setProject(contact, ref | null)`, `setConversationTtl(contact, minutes | null)` and `close()`. `parseConversationTtl` / `formatConversationTtl` in [`core/duration.ts`](../../src/core/duration.ts) are shared by the TUI and HTTP frontends.
 - Call `application.restore()` after you are subscribed, so early QR codes and status changes are not missed.
 - Do not close the application from a frontend that did not create the runtime; the creator of the runtime owns `close()`.
 
-The HTTP frontend follows this pattern: `startHttpServer({ application, settings })` returns `{ url, close() }` and neither restores nor closes the application. The lifecycle around it lives in `src/serve.ts`: `serveUntilStopped({ runtime, settings, stopped, output })` starts the server, then calls `application.restore()` once the server is subscribed (a failed restore is logged and leaves the dashboard up with forwarding disarmed), and on stop closes the server first and the runtime second. A new long-running frontend should reuse that ordering. See [`http.md`](http.md) for the authentication, session and API rules.
+The HTTP frontend follows this pattern: `startHttpServer({ application, settings })` returns `{ url, close() }` and neither restores nor closes the application. The lifecycle around it lives in [`src/serve.ts`](../../src/serve.ts): `serveUntilStopped({ runtime, settings, stopped, output })` starts the server, then calls `application.restore()` once the server is subscribed (a failed restore is logged and leaves the dashboard up with forwarding disarmed), and on stop closes the server first and the runtime second. A new long-running frontend should reuse that ordering. See the [HTTP API reference](../reference/http-api.md) for the authentication, session and API rules, and [Run wabgpt as a server](server.md) for running it.
 
 ## Testing an extension
 
 - Tests live in `tests/*.test.ts` and run with `npm test` (`tsx --test`). Type checking is `npm run check`.
-- `tests/support/core-fixtures.ts` provides in-memory persistence, temporary directories and the opaque reference policy; use them to drive `RoutingState` and `Application` with fake adapters, no network and no real accounts.
+- [`tests/support/core-fixtures.ts`](../../tests/support/core-fixtures.ts) provides in-memory persistence, temporary directories and the opaque reference policy; use them to drive `RoutingState` and `Application` with fake adapters, no network and no real accounts.
 - Never write tests that send real WhatsApp messages or ChatGPT prompts, and use synthetic ids and names in fixtures.

@@ -1,8 +1,14 @@
+---
+type: Reference
+title: Owner dashboard and HTTP API
+description: Authentication, security rules, routes, state shape and event stream of the owner web dashboard served by wabgpt serve.
+---
+
 # Owner dashboard and HTTP API
 
-`wabgpt serve` runs the same bridge as the terminal dashboard, headless, with a web dashboard for one trusted owner. It is not a multi-user service and has had no independent security audit. Keep it on loopback or a private network.
+`wabgpt serve` runs the same bridge as the [terminal dashboard](terminal.md), headless, with a web dashboard for one trusted owner. It is not a multi-user service and has had no independent security audit. Keep it on loopback or a private network. To run it, see [Server](../guides/server.md) and, for the container stack, [Docker Compose](../guides/docker-compose.md). Server settings (`host`, `port`, `tokenFile`, `publicOrigin`) are documented in [Configuration](configuration.md#the-server-block).
 
-Code: `src/interfaces/http/` (`server.ts` routes and event streams, `auth.ts` token file, sessions and login limiter, `policy.ts` Host/Origin rules and headers, `view.ts` response shaping). Static assets: `web/index.html`, `web/app.js`, `web/app.css` (plain JavaScript, no build step).
+Code: [`src/interfaces/http/`](../../src/interfaces/http/) ([`server.ts`](../../src/interfaces/http/server.ts) routes and event streams, [`auth.ts`](../../src/interfaces/http/auth.ts) token file, sessions and login limiter, [`policy.ts`](../../src/interfaces/http/policy.ts) Host/Origin rules and headers, [`view.ts`](../../src/interfaces/http/view.ts) response shaping). Static assets: [`web/index.html`](../../web/index.html), [`web/app.js`](../../web/app.js), [`web/app.css`](../../web/app.css) (plain JavaScript, no build step).
 
 ```ts
 startHttpServer({ application, settings, limits? }): Promise<{ url: string; close(): Promise<void> }>
@@ -31,6 +37,8 @@ curl -s -b "$JAR" -X POST -H "Origin: $BASE" -H 'Content-Type: application/json'
   -H "X-CSRF-Token: <csrfToken>" -d '{}' "$BASE/api/forwarding/pause"
 rm "$JAR"
 ```
+
+To rotate the token, see [Maintenance](../runbooks/maintenance.md).
 
 ## Security rules
 
@@ -68,7 +76,7 @@ All bodies and responses are JSON. Errors are `{ "error": "<code>", "message": "
 | `POST /api/contacts/project` | session + CSRF | `{ contactId, projectRef: string\|null }` | assigns or clears the project; never enables the contact; `409` if taken or invalid |
 | `POST /api/contacts/ttl` | session + CSRF | `{ contactId, ttl }` | `ttl` uses the terminal grammar (`90m`, `12h`, `3d`, `never`, empty = `24h`); `400` if invalid |
 
-`contactId` must be an id from the current directory (`State.contacts`); names are never accepted from the client.
+`contactId` must be an id from the current directory (`State.contacts`); names are never accepted from the client. Project and lifetime semantics are the same as in the terminal; see [Conversations](../concepts/conversations.md).
 
 ### State
 
@@ -98,4 +106,4 @@ Stable ids for scripted checks: login `#login`, `#login-form`, `#login-token`, `
 
 ## Remote access
 
-Preferred: keep `127.0.0.1` and use `ssh -L 8788:127.0.0.1:8788 host` or a VPN, then open `http://localhost:8788`. For a TLS reverse proxy, set `"server": { "publicOrigin": "https://wabgpt.example.com" }`, forward `Host` unchanged and restrict the proxy to the owner (VPN, mTLS or an authenticating proxy in addition to the owner token). Do not publish the BrowserOS MCP or noVNC ports.
+Preferred: keep `127.0.0.1` and use `ssh -L 8788:127.0.0.1:8788 host` or a VPN, then open `http://localhost:8788`. For a TLS reverse proxy, set `"server": { "publicOrigin": "https://wabgpt.example.com" }`, forward `Host` unchanged and restrict the proxy to the owner (VPN, mTLS or an authenticating proxy in addition to the owner token). Do not publish the BrowserOS MCP or noVNC ports. Exposure table and HTTPS proxy steps for the container stack: [Docker Compose](../guides/docker-compose.md).
