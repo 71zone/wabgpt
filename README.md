@@ -4,6 +4,8 @@ ChatGPT through WhatsApp. A self-hosted bridge that forwards selected contacts' 
 
 Built for one owner, with a terminal dashboard and an optional owner-only web dashboard. It uses the unofficial Baileys WhatsApp library, not the WhatsApp Business API or OpenAI API.
 
+![Terminal dashboard with contact details and private identifiers redacted](docs/assets/dashboard-redacted.png)
+
 ## Motivation
 
 I built wabgpt for my wife. Her workplace's website allowlist blocks ChatGPT while WhatsApp remains available. I wanted her to ask questions through WhatsApp without another app, my password or API-key setup. Reusing my existing ChatGPT subscription was part of the goal.
@@ -21,6 +23,8 @@ npm install
 npm link
 wabgpt
 ```
+
+![Real install and first-launch walkthrough on Ubuntu: npm install, npm link, then wabgpt asks which browser to use. WhatsApp pairing is omitted.](docs/assets/wabgpt-quick-start.gif)
 
 The first run guides you through choosing native or managed Docker BrowserOS, signing into ChatGPT yourself, linking WhatsApp by QR, and optionally configuring a contact's project and chat lifetime. Automatic replies require an explicit opt-in. No environment variables or Compose commands are needed for this path.
 
