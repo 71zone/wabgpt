@@ -1,16 +1,20 @@
 import { setTimeout } from 'node:timers/promises';
 import { z } from 'zod';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { NotSentError, type AssistantAdapter, type Logger, type Project } from '../../core/contracts.js';
+import { NotSentError, type AssistantAdapter, type Attachment, type Logger, type Project, type ReplyBlock } from '../../core/contracts.js';
 import { parseLocalMcpEndpoint } from '../../infrastructure/loopback.js';
+import type { MediaStore } from '../../infrastructure/media.js';
 import { isExpiredSession, listPagesPrelude, openMcp, reclaimTabGroup, runScript } from '../browseros/mcp.js';
-import { chatgptInspectionScript, composerName, composerReadyScript, settleScript, submitScript } from './dom.js';
+import { resolveBlocks } from './assets.js';
+import { chatgptInspectionScript, composerAttachmentsScript, composerName, composerReadyScript, settleScript, submitScript, uploadScript } from './dom.js';
+import { chatgptExtractionScript, extraction } from './extract.js';
 import { SingleFlight } from '../../core/single-flight.js';
 import { readProjectCatalog } from './projects.js';
 import { chatgptReferences, destinationPathPattern, isConversationPage, isDestination, normalizeConversationUrl, normalizeProjectUrl, type Destination } from './references.js';
 
 const pageResult = z.object({ pageId: z.number(), ready: z.boolean(), groupId: z.string() });
-const inspection = z.object({ url: z.string(), userId: z.string().nullable(), assistantId: z.string().nullable(), text: z.string(), complete: z.boolean(), busy: z.boolean(), error: z.string().nullable() });
+const inspection = z.object({ url: z.string(), userId: z.string().nullable(), assistantId: z.string().nullable(), text: z.string(), complete: z.boolean(), busy: z.boolean(), error: z.string().nullable(), media: z.boolean() });
+const composerState = z.object({ tiles: z.number(), uploading: z.number(), error: z.string().nullable() });
 const home = 'https://chatgpt.com/';
 /** Upper bound for closing the catalog's scratch tab after the read ended or was cancelled. */
 const scratchCleanupMs = 5000;
@@ -18,12 +22,15 @@ const scratchCleanupMs = 5000;
 const IDLE_LIMIT_MS = 5 * 60_000;
 /** Absolute ceiling on one reply, however much progress it shows. */
 const MAX_WAIT_MS = 60 * 60_000;
+/** ChatGPT must finish uploading the attachments of one prompt within this long, or the prompt is not sent. */
+const UPLOAD_LIMIT_MS = 3 * 60_000;
+const UPLOAD_POLL_MS = 500;
 
 /**
  * ChatGPT through BrowserOS Neo. A conversation or project reference is its canonical https://chatgpt.com URL, so refs map to the pages the tab visits without translation.
  * One delivery tab lives in one app-owned tab group; project listing uses its own MCP client and scratch tab and never touches delivery state.
  */
-export function createChatGPT(options: { endpoint: string; logger: Logger }): AssistantAdapter {
+export function createChatGPT(options: { endpoint: string; logger: Logger; media: MediaStore }): AssistantAdapter {
   const endpoint = parseLocalMcpEndpoint(options.endpoint);
   let client: Client | null = null;
   let runName = '';
@@ -76,6 +83,44 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
   async function inspect(targetUserId: string | null = null): Promise<z.infer<typeof inspection>> {
     const value = await run(`const result = await browser.page(${JSON.stringify(pageId)}).evaluateInPage(${chatgptInspectionScript},${JSON.stringify(targetUserId)}); return result.value;`);
     return inspection.parse(value);
+  }
+  async function composerAttachments(): Promise<z.infer<typeof composerState>> {
+    const value = await run(`const result = await browser.page(${JSON.stringify(pageId)}).evaluateInPage(${composerAttachmentsScript}); return result.value;`);
+    return composerState.parse(value);
+  }
+  /** Puts `files` in the composer and waits until ChatGPT has finished uploading every one. Nothing is submitted, so any failure here leaves the prompt unsent. */
+  async function attach(files: Attachment[], pathPattern: string): Promise<void> {
+    if (pageId === null) throw new Error('ChatGPT tab is not open.');
+    try {
+      if ((await composerAttachments()).tiles > 0) throw new Error('The ChatGPT composer already holds attachments from an earlier attempt; no prompt submitted.');
+      await run(uploadScript(pageId, pathPattern, files.map(file => file.path)));
+      const deadline = Date.now() + UPLOAD_LIMIT_MS;
+      let steady = 0;
+      for (;;) {
+        const state = await composerAttachments();
+        steady = state.tiles === files.length && state.uploading === 0 ? steady + 1 : 0;
+        if (steady >= 2) return;
+        if (Date.now() >= deadline) throw new Error(`ChatGPT did not finish uploading ${files.length === 1 ? 'the attachment' : 'the attachments'} (${state.tiles} of ${files.length} present, ${state.uploading} still uploading)${state.error ? `: ${state.error}` : ''}. No prompt submitted.`);
+        await setTimeout(UPLOAD_POLL_MS);
+      }
+    } catch (error) {
+      // A failed attempt can leave half-uploaded tiles in the composer, so the next attempt must start from a freshly loaded page.
+      currentUrl = null;
+      throw error;
+    }
+  }
+  /** Display-ordered blocks of the completed reply; any failure to read its structure falls back to the plain text so a finished reply is never lost. */
+  async function readBlocks(text: string, targetUserId: string): Promise<ReplyBlock[]> {
+    const plain: ReplyBlock[] = text.trim() ? [{ type: 'markdown', text }] : [];
+    if (pageId === null) return plain;
+    try {
+      const value = await run(`const result = await browser.page(${pageId}).evaluateInPage(${chatgptExtractionScript},${JSON.stringify(targetUserId)}); return result.value;`);
+      const blocks = await resolveBlocks(extraction.parse(value), { run, pageId, media: options.media, logger: options.logger });
+      return blocks.length > 0 ? blocks : plain;
+    } catch (error) {
+      options.logger(`Could not read the structure of ChatGPT's reply (${error instanceof Error ? error.message : String(error)}); delivering its plain text.`);
+      return plain;
+    }
   }
   async function ping(): Promise<void> {
     if (!client) throw new Error('BrowserOS is not connected.');
@@ -140,7 +185,7 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
       } finally { await disconnect(); pageId = null; groupId = null; currentUrl = null; }
     },
     listProjects(signal?: AbortSignal): Promise<Project[]> { return catalog.join(readCatalog, signal); },
-    async reply(input): Promise<{ conversationRef: string; text: string }> {
+    async reply(input): Promise<{ conversationRef: string; text: string; blocks?: ReplyBlock[] }> {
       if (working) throw new Error('Browser adapter is already processing a message.');
       working = true;
       let reconnected = false;
@@ -185,8 +230,9 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
           if (before.busy) throw new Error('This conversation is already generating a response.');
           if (before.error) throw new Error(`ChatGPT: ${before.error}`);
           if (pageId === null) throw new Error('ChatGPT tab is not open.');
+          if (input.attachments.length > 0) await attach(input.attachments, pathPattern);
           attempting = true;
-          const sent = await run(submitScript(pageId, pathPattern, input.text));
+          const sent = await run(submitScript(pageId, pathPattern, input.text, input.attachments.length));
           submitted = true;
           await remember(z.object({ url: z.string() }).parse(sent).url);
           return before;
@@ -199,6 +245,8 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
             reconnected = true; await reconnect(target); before = await submit();
           }
         } catch (error) {
+          // Files staged in the composer would ride along with whatever is sent from this page next, so a failure before submission discards the page state.
+          if (input.attachments.length > 0 && !submitted) currentUrl = null;
           // Nothing reached ChatGPT unless the submit click itself was attempted, so the bridge may safely try this same message again.
           if (attempting || submitted || error instanceof NotSentError) throw error;
           throw new NotSentError(error instanceof Error ? error.message : String(error), { cause: error });
@@ -228,7 +276,7 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
             acknowledged = true;
             await input.onSubmitted();
           }
-          if (saved && submittedUserId && observed.userId === submittedUserId && observed.assistantId && observed.complete && !observed.busy && observed.text.trim()) return { conversationRef: saved, text: observed.text };
+          if (saved && submittedUserId && observed.userId === submittedUserId && observed.assistantId && observed.complete && !observed.busy && (observed.text.trim() || observed.media)) return { conversationRef: saved, text: observed.text, blocks: await readBlocks(observed.text, submittedUserId) };
           if (observed.busy || observed.text !== lastText) { lastProgress = Date.now(); lastText = observed.text; }
           if (Date.now() - lastProgress >= IDLE_LIMIT_MS) break;
           await setTimeout(1000);

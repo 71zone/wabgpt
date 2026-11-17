@@ -30,6 +30,21 @@ A linked WhatsApp device reconnects on its own after network drops, sleep or VPN
 
 The bridge checks the MCP connection before submitting each prompt and when you press B. If BrowserOS rejects an expired session with HTTP 404, the bridge creates a new MCP session and reuses its recorded tab and group instead of opening a duplicate ChatGPT tab, with at most one recovery attempt per message. If expiry happens after submission, it resumes observation only when the conversation URL is known. An uncertain submission is never automatically repeated.
 
+## Photos and rich replies
+
+**Photos in.** A photo a contact sends (with or without a caption) is downloaded and attached to the ChatGPT prompt; the caption becomes the prompt text. Videos, voice notes, stickers and non-image documents are still ignored. A photo that cannot be downloaded or exceeds 64 MiB is logged and not forwarded, so ChatGPT never answers a half-message. Several photos sent together arrive as separate prompts.
+
+**Replies out.** The bridge reads the finished ChatGPT answer as structured blocks instead of flat text, then renders each block for WhatsApp so it reads well on a phone and copies cleanly:
+
+| ChatGPT content | On WhatsApp |
+|---|---|
+| Prose, headings, lists, quotes, links | WhatsApp formatting (`*bold*`, `_italic_`, `~strike~`, `- ` lists), split into messages of at most 4000 characters |
+| Code block | Its own message holding only the fenced code, so long-press copy gives clean code. Over 12000 characters it is sent as a `snippet.<ext>` document |
+| Table | Its own message with an aligned monospace grid when it fits a phone (at most 40 characters wide and 30 rows); otherwise one record per row. Tables with more than 8 rows or that do not fit also arrive as `table.csv`, which opens in Excel or Sheets |
+| Generated image or file | Native WhatsApp image or document, in its position in the reply |
+
+If extracting the rich content fails, the plain text of the reply is sent instead, so a finished reply is never lost. Files in transit live in `media/` under the data directory and are deleted after 24 hours.
+
 ## Self-healing and errors
 
 The bridge repairs itself rather than waiting for you to press R or re-enable a session.

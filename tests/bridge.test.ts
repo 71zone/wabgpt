@@ -11,7 +11,7 @@ async function fixture(run: (store: RoutingState, directory: string) => Promise<
 const bridgeOf = (store: RoutingState, assistant: AssistantAdapter, channel: MessagingAdapter, logger: (message: string) => void = () => {}): Bridge => new Bridge(store, assistant, channel, logger, providerNames);
 const alice = { id: '11111111111@s.whatsapp.net', name: 'Alice' };
 const bob = { id: '22222222222@s.whatsapp.net', name: 'Bob' };
-const incoming = (id: string, contact = alice, acknowledge: () => Promise<void> = async () => {}): IncomingMessage => ({ id, contact, text: `Question ${id}`, acknowledge });
+const incoming = (id: string, contact = alice, acknowledge: () => Promise<void> = async () => {}): IncomingMessage => ({ id, contact, text: `Question ${id}`, attachments: [], acknowledge });
 
 test('routes distinct contacts to persistent conversations and suppresses redelivery after restart', async () => {
   await fixture(async (store, directory) => {
@@ -378,8 +378,8 @@ test('colon-containing contact ids and identical raw delivery keys for different
     const channel = fakeChannel({ sendText: async (id, text) => { replies.push([id, text]); } });
     const bridge = bridgeOf(store, assistant, channel); bridge.arm();
     // Both messages produce the raw journal key "chan:a:1".
-    const first: IncomingMessage = { id: 'a:1', contact: short, text: 'from short', acknowledge: async () => {} };
-    const second: IncomingMessage = { id: '1', contact: long, text: 'from long', acknowledge: async () => {} };
+    const first: IncomingMessage = { id: 'a:1', contact: short, text: 'from short', attachments: [], acknowledge: async () => {} };
+    const second: IncomingMessage = { id: '1', contact: long, text: 'from long', attachments: [], acknowledge: async () => {} };
     bridge.receive(first); bridge.receive(second); bridge.receive(first); bridge.receive(second);
     await bridge.idle();
     assert.deepEqual(replies, [['chan', 'Answer from short'], ['chan:a', 'Answer from long']]);
@@ -401,7 +401,7 @@ test('an alias with a colon-containing id is deduplicated against its canonical 
       return { conversationRef: 'https://chatgpt.com/c/alias-colon', text: 'Answer' };
     } });
     const bridge = bridgeOf(store, assistant, fakeChannel()); bridge.arm();
-    const viaAlias: IncomingMessage = { id: 'm:1', contact: { id: alias.alias, name: 'Carol' }, text: 'hello', acknowledge: async () => {} };
+    const viaAlias: IncomingMessage = { id: 'm:1', contact: { id: alias.alias, name: 'Carol' }, text: 'hello', attachments: [], acknowledge: async () => {} };
     bridge.receive(viaAlias); await bridge.idle();
     await store.linkIdentity(alias);
     bridge.receive(viaAlias);

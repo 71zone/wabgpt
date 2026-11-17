@@ -5,13 +5,14 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
-import type { IdentityAlias, IncomingMessage } from '../src/core/contracts.js';
+import { NotSentError, type IdentityAlias, type IncomingMessage } from '../src/core/contracts.js';
 import { createWhatsApp } from '../src/adapters/whatsapp/whatsapp.js';
 import { createDirectorySaver } from '../src/adapters/whatsapp/autosave.js';
 import { createLinkState } from '../src/adapters/whatsapp/connection.js';
 import { Directory } from '../src/adapters/whatsapp/directory.js';
 import { createInbound } from '../src/adapters/whatsapp/inbound.js';
 import { createDirectoryIngest } from '../src/adapters/whatsapp/ingestion.js';
+import { createMediaStore } from '../src/infrastructure/media.js';
 
 const PN = '14155551234@s.whatsapp.net';
 const LID = '123456789@lid';
@@ -22,7 +23,11 @@ async function withAuthDir(prefix: string, run: (authDir: string) => Promise<voi
 }
 
 function idleOptions(authDir: string) {
-  return { authDir, logger: () => {}, onMessage: () => {}, onStatus: () => {} };
+  return {
+    authDir, logger: () => {}, onMessage: () => {}, onStatus: () => {},
+    media: createMediaStore(join(authDir, 'media')),
+    outboundTiming: { firstConnectWaitMs: 20, pollMs: 5 },
+  };
 }
 
 test('a restarted adapter lists saved contacts before connecting or receiving another history sync', async () => {
@@ -102,7 +107,7 @@ test('resolveContact accepts international numbers and direct JIDs, preferring s
 test('sending requires an open connection', async () => {
   await withAuthDir('wa-send-', async authDir => {
     const adapter = createWhatsApp(idleOptions(authDir));
-    await assert.rejects(adapter.sendText(PN, 'hello'), /WhatsApp is not connected/);
+    await assert.rejects(adapter.sendReply(PN, [{ type: 'markdown', text: 'hello' }]), error => error instanceof NotSentError && /WhatsApp is not connected/.test(error.message));
     await adapter.stop();
   });
 });
@@ -122,7 +127,7 @@ test('live inbound policy forwards only fresh direct notify text and keeps recei
     link.open = true;
     link.startedAtSeconds = 1_700_000_000;
     const received: IncomingMessage[] = [];
-    const inbound = createInbound({ directory, ingest, saver, link, logger: () => {}, onMessage: message => received.push(message) });
+    const inbound = createInbound({ directory, ingest, saver, link, logger: () => {}, media: createMediaStore(join(authDir, 'media')), onMessage: message => received.push(message) });
     const ev = new EventEmitter();
     const detach = inbound.attach(ev as unknown as WASocket['ev']);
 

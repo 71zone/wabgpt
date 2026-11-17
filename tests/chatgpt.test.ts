@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { runInNewContext } from 'node:vm';
@@ -6,8 +6,12 @@ import { z } from 'zod';
 import { parseHTML } from 'linkedom';
 import { createChatGPT } from '../src/adapters/chatgpt/chatgpt.js';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Application } from '../src/core/application.js';
+import { NotSentError, type Attachment, type ReplyBlock } from '../src/core/contracts.js';
+import { createMediaStore } from '../src/infrastructure/media.js';
 import { fakeChannel, loadState, providerNames, withDirectory } from './support/core-fixtures.js';
 
 const rpcSchema = z.object({ id: z.union([z.number(), z.string()]).optional(), method: z.string(), params: z.object({ name: z.string().optional(), arguments: z.object({ code: z.string().optional(), action: z.string().optional(), groupId: z.string().optional(), url: z.string().optional() }).passthrough().optional() }).passthrough().optional() });
@@ -16,6 +20,10 @@ const projectA = 'g-p-00000000000000000000000000000001';
 const projectB = 'g-p-00000000000000000000000000000002';
 const urlA = `https://chatgpt.com/g/${projectA}`;
 const urlB = `https://chatgpt.com/g/${projectB}`;
+
+const mediaDirectory = join(tmpdir(), `wabgpt-chatgpt-media-${process.pid}`);
+const media = createMediaStore(mediaDirectory);
+after(async () => { await rm(mediaDirectory, { recursive: true, force: true }); });
 
 interface Sidebar {
   projects: { id: string; name: string }[]; limit: number | null; revealed: boolean; collapsed: boolean; signedOut: boolean; hydrateAfter: number; reads: number;
@@ -44,6 +52,36 @@ function runCatalogScript(state: State, script: string, mode: unknown, url: stri
   document.querySelector('section[data-app-action-sidebar-section-heading="Projects"] [data-app-action-sidebar-section-toggle]')?.addEventListener('click', () => { sidebar.collapsed = !sidebar.collapsed; sidebar.toggles++; if (sidebar.signOutOnToggle) sidebar.signedOut = true; });
   return runInNewContext(`(${script})(${JSON.stringify(mode)})`, { document, location: { href: url } });
 }
+
+function stageFakeAsset(rich: Rich, id: number): unknown {
+  const asset = rich.assets.get(id);
+  if (!asset) return { error: 'The asset is no longer on the page.' };
+  if ('error' in asset) return asset;
+  return { size: asset.bytes.length, mime: asset.mime, name: asset.name };
+}
+
+function readFakeChunk(rich: Rich, argument: unknown): unknown {
+  const { id, offset, length } = z.object({ id: z.number(), offset: z.number(), length: z.number() }).parse(argument);
+  const asset = rich.assets.get(id);
+  if (!asset || 'error' in asset) return { error: 'The staged asset is gone.' };
+  return { data: asset.bytes.subarray(offset, offset + length).toString('base64') };
+}
+
+/** An image or file ChatGPT offers for the current reply; `error` makes the page report a failed transfer. */
+type FakeAsset = { mime: string; name: string | null; bytes: Buffer } | { error: string };
+/** The composer, upload and reply-content side of the fake ChatGPT page. */
+interface Rich {
+  /** Ordered page actions: `upload`, `fill:<text>` and `send:<attachments staged>`. */
+  events: string[]; uploads: string[][];
+  /** Files currently held by the composer, and how many composer polls still report an unfinished upload. */
+  staged: number; uploadPolls: number; uploadFails: boolean; menuOpen: boolean;
+  /** After this many composer polls the composer silently loses its files (a reloaded tab); null never does. */
+  composerPolls: number; dropAfterPolls: number | null;
+  /** Overrides the reply text; null keeps 'Completed response'. `media` marks a reply with an image or file. */
+  replyText: string | null; media: boolean;
+  /** What the extraction script returns; an Error makes it throw. */
+  extraction: unknown; assets: Map<number, FakeAsset>; released: number[];
+}
 interface State {
   initializations: number; submissions: number; disconnectOnSubmit: boolean; expireAfterSubmit: boolean; complete: boolean; initialTurns: number;
   reclaimedGroups: number; chatgptTabsOpened: number; opened: string[]; groupIdsOmitted: boolean; tabGroupListings: number;
@@ -51,7 +89,7 @@ interface State {
   /** When set, the sidebar read request is accepted and then never answered; `blockedClosed` counts those exchanges the client later aborted. */
   blockSidebarReads: boolean; blocked: number; blockedClosed: number;
   projects: Set<string>; redirects: Map<string, string>; slugConversations: boolean; driftAfterInspect: string | null; driftOnObserve: string | null;
-  sidebar: Sidebar;
+  sidebar: Sidebar; rich: Rich;
 }
 interface Fixture { endpoint: string; expire(): void; tabs(): string[]; moveTabs(url: string): void; state: State }
 
@@ -61,13 +99,14 @@ async function withServer(run: (fixture: Fixture) => Promise<void>): Promise<voi
     initializations: 0, submissions: 0, disconnectOnSubmit: false, expireAfterSubmit: false, complete: true, initialTurns: 0, reclaimedGroups: 0, chatgptTabsOpened: 0, opened, groupIdsOmitted: false, tabGroupListings: 0,
     navigations: [], waits: [], submittedAt: [], conversations: 0, blockSidebarReads: false, blocked: 0, blockedClosed: 0, projects: new Set([projectA, projectB]), redirects: new Map(), slugConversations: false, driftAfterInspect: null, driftOnObserve: null,
     sidebar: { projects: [], limit: null, revealed: false, collapsed: false, signedOut: false, hydrateAfter: 0, reads: 0, explorerCount: null, chatMoreClicks: 0, recentsMoreClicks: 0, toggles: 0, signOutOnToggle: false },
+    rich: { events: [], uploads: [], staged: 0, uploadPolls: 0, uploadFails: false, menuOpen: false, composerPolls: 0, dropAfterPolls: null, replyText: null, media: false, extraction: null, assets: new Map(), released: [] },
   };
   const sessions = new Set<string>();
   const counts = new Map<string, number>();
   const landing = /^(https:\/\/chatgpt\.com\/g\/g-p-[0-9a-f]{32})(?:-[a-z]+)?\/project$/;
   let nextPage = 0;
   let disconnectCurrent = (): void => {};
-  const pages = new Map<number, { id: number; owner: string; groupId: string; readonly url: string; move(url: string): void; goto(url: string): Promise<void>; waitForSelector(selector: string, options?: unknown): Promise<void>; snapshot(): Promise<unknown>; fill(ref: string, value: string): Promise<void>; click(ref: string): Promise<void>; evaluateInPage(fn: unknown, target?: string | null): Promise<unknown>; close(): Promise<void> }>();
+  const pages = new Map<number, { id: number; owner: string; groupId: string; readonly url: string; move(url: string): void; goto(url: string): Promise<void>; waitForSelector(selector: string, options?: unknown): Promise<void>; snapshot(): Promise<unknown>; fill(ref: string, value: string): Promise<void>; click(ref: string): Promise<unknown>; upload(ref: string | null, files: string[]): Promise<unknown>; evaluateInPage(fn: unknown, target?: unknown): Promise<unknown>; close(): Promise<void> }>();
   // What ChatGPT does with a navigation: canonicalize project landings, send missing projects home, or follow a scripted redirect.
   const resolve = (target: string): string => {
     const scripted = state.redirects.get(target);
@@ -88,9 +127,18 @@ async function withServer(run: (fixture: Fixture) => Promise<void>): Promise<voi
       move: (next: string) => { url = next; },
       goto: async (next: string) => { url = resolve(next); state.opened.push(next); state.navigations.push(next); },
       waitForSelector: async (selector: string) => { state.waits.push(selector); },
-      snapshot: async () => ({ url, refs: [{ role: 'textbox', name: /\/project$/.test(url) ? 'New chat in Example' : 'Ask ChatGPT', ref: 'editor' }, { role: 'button', name: 'Send', ref: 'send' }] }),
-      fill: async (_ref: string, _value: string) => {},
-      click: async () => {
+      snapshot: async () => ({ url, refs: [{ role: 'textbox', name: /\/project$/.test(url) ? 'New chat in Example' : 'Ask ChatGPT', ref: 'editor' }, { role: 'button', name: 'Add files and more', ref: 'add' }, ...(state.rich.menuOpen ? [{ role: 'button', name: 'Add photos & files Upload from computer', ref: 'photos' }] : []), { role: 'button', name: 'Send', ref: 'send' }] }),
+      fill: async (_ref: string, value: string) => { state.rich.events.push(`fill:${value}`); },
+      upload: async (ref: string | null, files: string[]) => {
+        if (ref !== null || !state.rich.menuOpen) throw new Error('No file chooser is open.');
+        if (state.rich.uploadFails) throw new Error('Upload rejected');
+        state.rich.menuOpen = false; state.rich.staged += files.length; state.rich.uploads.push(Array.from(files)); state.rich.events.push('upload');
+        return { files, uploaded: files.length };
+      },
+      click: async (ref: string) => {
+        if (ref === 'add') { state.rich.menuOpen = true; return undefined; }
+        if (ref === 'photos') return { fileChooserOpen: true, multiple: true, page: id };
+        state.rich.events.push(`send:${state.rich.staged}`); state.rich.staged = 0;
         state.submissions++; state.submittedAt.push(url);
         if (url === 'https://chatgpt.com/') url = `https://chatgpt.com/c/new-conversation-${++state.conversations}`;
         else {
@@ -100,15 +148,31 @@ async function withServer(run: (fixture: Fixture) => Promise<void>): Promise<voi
         state.opened.push(url); counts.set(url, (counts.get(url) ?? state.initialTurns) + 1);
         if (state.disconnectOnSubmit) disconnectCurrent();
         if (state.expireAfterSubmit) { sessions.clear(); state.expireAfterSubmit = false; }
+        return undefined;
       },
-      evaluateInPage: async (fn: unknown, targetUser?: unknown) => {
+      evaluateInPage: async (fn: unknown, argument?: unknown) => {
         const source = String(fn);
-        if (source.includes('data-app-action-sidebar-project-id') || source.includes('data-project-row')) return { value: runCatalogScript(state, source, targetUser, url) };
+        if (source.includes('data-app-action-sidebar-project-id') || source.includes('data-project-row')) return { value: runCatalogScript(state, source, argument, url) };
+        if (source.includes('data-composer-attachments')) {
+          if (state.rich.dropAfterPolls !== null && ++state.rich.composerPolls > state.rich.dropAfterPolls) state.rich.staged = 0;
+          const uploading = state.rich.uploadPolls > 0 ? 1 : 0;
+          if (uploading) state.rich.uploadPolls--;
+          return { value: { tiles: state.rich.staged, uploading, error: null } };
+        }
+        if (source.includes('data-response-body')) {
+          if (state.rich.extraction instanceof Error) throw state.rich.extraction;
+          return { value: state.rich.extraction };
+        }
+        if (source.includes('data-wab-asset')) return { value: stageFakeAsset(state.rich, Number(argument)) };
+        if (source.includes('arrayBuffer')) return { value: readFakeChunk(state.rich, argument) };
+        if (source.includes('__wabAssets')) { state.rich.released.push(Number(argument)); return { value: true }; }
+        const targetUser = argument;
         if (state.driftOnObserve && state.submissions > 0) { url = state.driftOnObserve; state.driftOnObserve = null; }
         const count = counts.get(url) ?? state.initialTurns;
         const userId = count ? `user-${count}` : null;
         const matched = !targetUser || targetUser === userId;
-        const value = { url, users: Math.min(count, 5), assistants: Math.min(state.complete ? count : Math.max(0, count - 1), 5), userId: matched ? userId : null, assistantId: matched && count && state.complete ? `assistant-${count}` : null, text: matched && state.complete && count ? 'Completed response' : '', complete: matched && state.complete, busy: !state.complete && count > 0, error: null };
+        const text = state.rich.replyText ?? 'Completed response';
+        const value = { url, users: Math.min(count, 5), assistants: Math.min(state.complete ? count : Math.max(0, count - 1), 5), userId: matched ? userId : null, assistantId: matched && count && state.complete ? `assistant-${count}` : null, text: matched && state.complete && count ? text : '', complete: matched && state.complete, busy: !state.complete && count > 0, error: null, media: state.rich.media };
         if (state.driftAfterInspect) { url = state.driftAfterInspect; state.driftAfterInspect = null; }
         return { value };
       },
@@ -184,11 +248,11 @@ async function withServer(run: (fixture: Fixture) => Promise<void>): Promise<voi
   }
 }
 
-const quiet = { onConversation: async (): Promise<void> => {}, onSubmitted: async (): Promise<void> => {} };
+const quiet = { attachments: [] as Attachment[], onConversation: async (): Promise<void> => {}, onSubmitted: async (): Promise<void> => {} };
 
 test('expired MCP sessions reconnect before submission and keep the saved conversation', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start(); fixture.expire();
       const reply = await browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'A new message', ...quiet });
@@ -204,11 +268,11 @@ test('expired MCP sessions reconnect before submission and keep the saved conver
 
 test('a lost response after submitting never causes another submission', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     let acknowledgements = 0;
     try {
       await browser.start(); fixture.state.disconnectOnSubmit = true;
-      await assert.rejects(browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Send once', onConversation: async () => {}, onSubmitted: async () => { acknowledgements++; } }));
+      await assert.rejects(browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Send once', attachments: [], onConversation: async () => {}, onSubmitted: async () => { acknowledgements++; } }));
       assert.equal(fixture.state.submissions, 1);
       assert.equal(fixture.state.initializations, 1);
       assert.equal(acknowledgements, 0);
@@ -218,7 +282,7 @@ test('a lost response after submitting never causes another submission', async (
 
 test('session expiry during observation reopens the known conversation without resubmitting', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start(); fixture.state.expireAfterSubmit = true;
       const reply = await browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Send once', ...quiet });
@@ -233,12 +297,12 @@ test('session expiry during observation reopens the known conversation without r
 
 test('prompt acceptance is acknowledged once before the assistant response completes', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     let acknowledgements = 0;
     try {
       await browser.start(); fixture.state.complete = false;
       const reply = await browser.reply({
-        conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Accept before generating',
+        conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Accept before generating', attachments: [],
         onConversation: async () => {},
         onSubmitted: async () => {
           assert.equal(fixture.state.complete, false);
@@ -256,12 +320,12 @@ test('prompt acceptance is acknowledged once before the assistant response compl
 test('a completed response is returned when the virtualized conversation has already filled its rendered window', { timeout: 5000 }, async () => {
   await withServer(async fixture => {
     fixture.state.initialTurns = 5;
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     let accepted = 0;
     try {
       await browser.start();
       const reply = await browser.reply({
-        conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'New turn in a full window',
+        conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'New turn in a full window', attachments: [],
         onConversation: async () => {}, onSubmitted: async () => { accepted++; },
       });
       assert.equal(reply.text, 'Completed response');
@@ -274,11 +338,11 @@ test('a completed response is returned when the virtualized conversation has alr
 test('a new chat for a project starts at the project landing, waits for the composer and persists the scoped conversation', async () => {
   await withServer(async fixture => {
     fixture.state.slugConversations = true;
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     const saved: string[] = [];
     try {
       await browser.start();
-      const reply = await browser.reply({ conversationRef: null, projectRef: `${urlA}-example/project?utm=1#top`, text: 'Hello project', onConversation: async url => { saved.push(url); }, onSubmitted: async () => {} });
+      const reply = await browser.reply({ conversationRef: null, projectRef: `${urlA}-example/project?utm=1#top`, text: 'Hello project', attachments: [], onConversation: async url => { saved.push(url); }, onSubmitted: async () => {} });
       assert.equal(fixture.state.navigations.at(-1), urlA);
       assert.deepEqual(fixture.state.waits, ['[contenteditable="true"][role="textbox"]']);
       assert.deepEqual(fixture.state.submittedAt, [`${urlA}-example/project`]);
@@ -293,23 +357,23 @@ test('a new chat for a project starts at the project landing, waits for the comp
 test('a saved project conversation is reused without navigation, recovered when the tab moved, and rotation returns to the landing', async () => {
   await withServer(async fixture => {
     fixture.state.slugConversations = true;
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     const saved: string[] = [];
     const remember = async (url: string): Promise<void> => { saved.push(url); };
     try {
       await browser.start();
-      const first = await browser.reply({ conversationRef: null, projectRef: urlA, text: 'one', onConversation: remember, onSubmitted: async () => {} });
+      const first = await browser.reply({ conversationRef: null, projectRef: urlA, text: 'one', attachments: [], onConversation: remember, onSubmitted: async () => {} });
       const navigations = fixture.state.navigations.length;
-      const second = await browser.reply({ conversationRef: first.conversationRef, projectRef: urlA, text: 'two', onConversation: remember, onSubmitted: async () => {} });
+      const second = await browser.reply({ conversationRef: first.conversationRef, projectRef: urlA, text: 'two', attachments: [], onConversation: remember, onSubmitted: async () => {} });
       assert.equal(second.conversationRef, first.conversationRef);
       assert.equal(fixture.state.navigations.length, navigations, 'the slug-canonicalized tab is already the saved conversation');
       fixture.moveTabs('https://chatgpt.com/c/elsewhere');
-      const third = await browser.reply({ conversationRef: first.conversationRef, projectRef: urlA, text: 'three', onConversation: remember, onSubmitted: async () => {} });
+      const third = await browser.reply({ conversationRef: first.conversationRef, projectRef: urlA, text: 'three', attachments: [], onConversation: remember, onSubmitted: async () => {} });
       assert.equal(third.conversationRef, first.conversationRef);
       assert.equal(fixture.state.navigations.at(-1), first.conversationRef);
       assert.equal(fixture.state.submissions, 3);
       assert.deepEqual(saved, [first.conversationRef]);
-      const rotated = await browser.reply({ conversationRef: null, projectRef: urlA, text: 'fresh', onConversation: remember, onSubmitted: async () => {} });
+      const rotated = await browser.reply({ conversationRef: null, projectRef: urlA, text: 'fresh', attachments: [], onConversation: remember, onSubmitted: async () => {} });
       assert.equal(fixture.state.navigations.at(-1), urlA);
       assert.notEqual(rotated.conversationRef, first.conversationRef);
       assert.match(rotated.conversationRef, new RegExp(`^${urlA}/c/new-conversation-2$`));
@@ -322,7 +386,7 @@ test('a saved project conversation is reused without navigation, recovered when 
 
 test('rotation to a fresh conversation navigates to the landing even when the tracked tab URL is stale', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start();
       await browser.reply({ conversationRef: null, projectRef: null, text: 'one', ...quiet });
@@ -344,7 +408,7 @@ for (const [name, redirect] of [
 ] as const) {
   test(`a project landing that redirects to ${name} is never submitted to`, async () => {
     await withServer(async fixture => {
-      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
       try {
         await browser.start();
         fixture.state.redirects.set(urlA, redirect);
@@ -359,7 +423,7 @@ for (const [name, redirect] of [
 test('a deleted project that falls back to the home page is never submitted to', async () => {
   await withServer(async fixture => {
     fixture.state.projects.delete(projectA);
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await assert.rejects(browser.start().then(() => browser.reply({ conversationRef: null, projectRef: urlA, text: 'Never sent', ...quiet })), /project did not load/);
       assert.equal(fixture.state.submissions, 0);
@@ -369,7 +433,7 @@ test('a deleted project that falls back to the home page is never submitted to',
 
 test('a saved project conversation that redirects elsewhere is never submitted to', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start();
       fixture.state.redirects.set(`${urlA}/c/existing`, `${urlB}-other/project`);
@@ -381,7 +445,7 @@ test('a saved project conversation that redirects elsewhere is never submitted t
 
 test('a tab that leaves the project between inspection and sending is never submitted to', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start();
       fixture.state.driftAfterInspect = 'https://chatgpt.com/';
@@ -394,13 +458,13 @@ test('a tab that leaves the project between inspection and sending is never subm
 for (const [name, projectRef, scope] of [['project', urlA, urlA], ['standalone', null, 'https://chatgpt.com']] as const) {
   test(`the first persisted ${name} conversation stays pinned when the tab drifts to another conversation in the same scope`, async () => {
     await withServer(async fixture => {
-      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
       const saved: string[] = [];
       let acknowledgements = 0;
       try {
         await browser.start();
         fixture.state.driftOnObserve = `${scope}/c/unrelated-chat`;
-        await assert.rejects(browser.reply({ conversationRef: null, projectRef, text: 'Pinned', onConversation: async url => { saved.push(url); }, onSubmitted: async () => { acknowledgements++; } }), /switched conversations/);
+        await assert.rejects(browser.reply({ conversationRef: null, projectRef, text: 'Pinned', attachments: [], onConversation: async url => { saved.push(url); }, onSubmitted: async () => { acknowledgements++; } }), /switched conversations/);
         assert.deepEqual(saved, [`${scope}/c/new-conversation-1`]);
         assert.equal(acknowledgements, 0);
         assert.equal(fixture.state.submissions, 1);
@@ -411,7 +475,7 @@ for (const [name, projectRef, scope] of [['project', urlA, urlA], ['standalone',
 
 test('project conversations recover from expired MCP sessions before and after submission without replay or extra tabs', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     const conversation = `${urlA}/c/existing`;
     try {
       await browser.start(); fixture.expire();
@@ -434,7 +498,7 @@ test('project conversations recover from expired MCP sessions before and after s
 
 test('a new project chat survives an expired MCP session before submission with a single submission and tab', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start(); fixture.expire();
       const reply = await browser.reply({ conversationRef: null, projectRef: urlA, text: 'Fresh project chat', ...quiet });
@@ -449,7 +513,7 @@ test('a new project chat survives an expired MCP session before submission with 
 
 test('malformed, hostile or wrong-project URLs are rejected before the browser is touched', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start();
       const navigations = [...fixture.state.navigations];
@@ -494,7 +558,7 @@ test('the catalog reveals every project hidden behind the sidebar Show more, ign
   await withServer(async fixture => {
     Object.assign(fixture.state.sidebar, { projects: [...catalogProjects, catalogProjects[0]], limit: 5 });
     fixture.state.sidebar.explorerCount = 7;
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     assert.deepEqual(await browser.listProjects(), sortedCatalog);
     assert.equal(fixture.state.sidebar.revealed, true);
     assert.equal(fixture.state.sidebar.chatMoreClicks, 0);
@@ -507,7 +571,7 @@ test('the catalog reveals every project hidden behind the sidebar Show more, ign
 test('the catalog waits for the sidebar to hydrate instead of reporting an early empty list', async () => {
   await withServer(async fixture => {
     Object.assign(fixture.state.sidebar, { projects: catalogProjects.slice(0, 3), hydrateAfter: 2 });
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     assert.deepEqual((await browser.listProjects()).map(project => project.name), ['apple notes', 'Banana', 'Zebra']);
     assert.deepEqual(fixture.tabs(), []);
   });
@@ -515,7 +579,7 @@ test('the catalog waits for the sidebar to hydrate instead of reporting an early
 
 test('an account with no projects yields a verified empty catalog', { timeout: 20_000 }, async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     assert.deepEqual(await browser.listProjects(), []);
     assert.deepEqual(fixture.tabs(), []);
   });
@@ -529,7 +593,7 @@ for (const [name, prepare, message] of [
   test(`the catalog rejects rather than returning a partial or empty list when ${name}, and closes its scratch tab`, async () => {
     await withServer(async fixture => {
       prepare(fixture.state);
-      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
       await assert.rejects(browser.listProjects(), message);
       assert.deepEqual(fixture.tabs(), []);
       await assert.rejects(browser.listProjects(), message);
@@ -540,7 +604,7 @@ for (const [name, prepare, message] of [
 test('a collapsed Projects section is expanded in the scratch tab for the read and collapsed again afterwards', async () => {
   await withServer(async fixture => {
     Object.assign(fixture.state.sidebar, { projects: catalogProjects.slice(0, 3), collapsed: true });
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     assert.deepEqual((await browser.listProjects()).map(project => project.name), ['apple notes', 'Banana', 'Zebra']);
     assert.equal(fixture.state.sidebar.collapsed, true);
     assert.equal(fixture.state.sidebar.toggles, 2);
@@ -555,7 +619,7 @@ for (const [name, prepare, message] of [
   test(`a collapsed Projects section is collapsed again and the scratch tab closed when ${name}`, async () => {
     await withServer(async fixture => {
       prepare(fixture.state);
-      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
       await assert.rejects(browser.listProjects(), message);
       assert.equal(fixture.state.sidebar.collapsed, true);
       assert.equal(fixture.state.sidebar.toggles, 2);
@@ -567,12 +631,12 @@ for (const [name, prepare, message] of [
 test('listing projects mid-reply uses its own session and tab, never touches the delivery tab and shares one lookup between concurrent callers', async () => {
   await withServer(async fixture => {
     Object.assign(fixture.state.sidebar, { projects: catalogProjects.slice(0, 2) });
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     let listed: unknown[] = [];
     try {
       await browser.start(); fixture.state.complete = false;
       const reply = await browser.reply({
-        conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Reply while the picker loads',
+        conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Reply while the picker loads', attachments: [],
         onConversation: async () => {},
         onSubmitted: async () => {
           const navigationsBefore = fixture.state.navigations.length;
@@ -604,7 +668,7 @@ async function until(condition: () => boolean, what: string): Promise<void> {
 test('cancelling a catalog whose MCP request is blocked aborts that request, closes the scratch tab and leaves the delivery session alone', { timeout: 20_000 }, async () => {
   await withServer(async fixture => {
     Object.assign(fixture.state.sidebar, { projects: catalogProjects.slice(0, 2) });
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start();
       const deliveryTabs = fixture.tabs();
@@ -635,7 +699,7 @@ test('Application.close cancels an in-flight catalog blocked on the MCP server, 
   await withDirectory(async directory => {
     await withServer(async fixture => {
       fixture.state.blockSidebarReads = true;
-      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
       const app = new Application({ configPath: join(directory, 'config.json'), ...providerNames }, await loadState(directory), fakeChannel(), browser);
       const listing = assert.rejects(app.listProjects(), /closing/);
       await until(() => fixture.state.blocked === 1, 'the sidebar read to reach the server and block');
@@ -649,7 +713,7 @@ test('Application.close cancels an in-flight catalog blocked on the MCP server, 
 
 test('cancelling before the catalog starts rejects with the reason and opens nothing', async () => {
   await withServer(async fixture => {
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     await assert.rejects(browser.listProjects(AbortSignal.abort(new Error('never started'))), /never started/);
     assert.equal(fixture.state.initializations, 0);
     assert.deepEqual(fixture.tabs(), []);
@@ -657,21 +721,21 @@ test('cancelling before the catalog starts rejects with the reason and opens not
 });
 
 test('the adapter exposes the ChatGPT reference policy and refuses endpoints that are not local', () => {
-  const assistant = createChatGPT({ endpoint: 'http://127.0.0.1:9/mcp', logger: () => {} });
+  const assistant = createChatGPT({ endpoint: 'http://127.0.0.1:9/mcp', logger: () => {}, media });
   assert.equal(assistant.references.normalizeProject(`${urlA}-example/project?x=1`), urlA);
   assert.equal(assistant.references.normalizeConversation(`${urlA}-example/c/abc?x=1`, urlA), `${urlA}/c/abc`);
   assert.equal(assistant.references.normalizeConversation('https://chatgpt.com/c/abc#top', null), 'https://chatgpt.com/c/abc');
   assert.throws(() => assistant.references.normalizeProject('https://evil.example/g/' + projectA));
   assert.throws(() => assistant.references.normalizeConversation('https://chatgpt.com/c/abc', urlA));
   for (const endpoint of ['https://example.com/mcp', 'http://192.0.2.1:9010/mcp', 'http://user:pw@127.0.0.1:9010/mcp', 'ftp://127.0.0.1/mcp', 'not a url']) {
-    assert.throws(() => createChatGPT({ endpoint, logger: () => {} }), Error, endpoint);
+    assert.throws(() => createChatGPT({ endpoint, logger: () => {}, media }), Error, endpoint);
   }
 });
 
 test('when page records carry no groupId, group membership from tabGroups keeps start, 404 recovery and replies on one tab', async () => {
   await withServer(async fixture => {
     fixture.state.groupIdsOmitted = true;
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     const conversation = `${urlA}/c/existing`;
     try {
       await browser.start();
@@ -700,7 +764,7 @@ test('when page records carry no groupId, group membership from tabGroups keeps 
 test('a new standalone chat survives a 404 before submission without duplicate tabs when groups come only from tabGroups', async () => {
   await withServer(async fixture => {
     fixture.state.groupIdsOmitted = true;
-    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {} });
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
     try {
       await browser.start(); fixture.expire();
       const reply = await browser.reply({ conversationRef: null, projectRef: null, text: 'Fresh chat', ...quiet });
@@ -712,3 +776,189 @@ test('a new standalone chat survives a 404 before submission without duplicate t
     } finally { await browser.stop().catch(() => undefined); }
   });
 });
+
+async function photo(name = 'photo.png'): Promise<Attachment> {
+  const path = await media.allocate(name);
+  await writeFile(path, Buffer.from('not really a png'));
+  return { kind: 'image', path, fileName: name, mimeType: 'image/png' };
+}
+
+function attachmentOf(block: ReplyBlock | undefined): Attachment {
+  assert.equal(block?.type, 'attachment');
+  if (block?.type !== 'attachment') throw new Error('not an attachment block');
+  return block.attachment;
+}
+
+for (const [name, conversationRef, projectRef, submittedAt] of [
+  ['an existing conversation', 'https://chatgpt.com/c/existing', null, 'https://chatgpt.com/c/existing'],
+  ['a new standalone chat', null, null, 'https://chatgpt.com/'],
+  ['a new project chat', null, urlA, `${urlA}-example/project`],
+] as const) {
+  test(`attachments for ${name} are uploaded and finished before the caption is typed and sent`, async () => {
+    await withServer(async fixture => {
+      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
+      const file = await photo();
+      try {
+        await browser.start();
+        fixture.state.rich.uploadPolls = 3;
+        const reply = await browser.reply({ conversationRef, projectRef, text: 'What is this?', ...quiet, attachments: [file] });
+        assert.deepEqual(fixture.state.rich.uploads, [[file.path]]);
+        assert.deepEqual(fixture.state.rich.events, ['upload', 'fill:What is this?', 'send:1']);
+        assert.equal(fixture.state.rich.uploadPolls, 0, 'the prompt waited for the upload to finish');
+        assert.deepEqual(fixture.state.submittedAt, [submittedAt]);
+        assert.equal(reply.text, 'Completed response');
+      } finally { await browser.stop().catch(() => undefined); }
+    });
+  });
+}
+
+test('a photo without a caption is sent alone: nothing is typed and no text is invented', async () => {
+  await withServer(async fixture => {
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
+    const first = await photo('one.png');
+    const second = await photo('two.png');
+    try {
+      await browser.start();
+      await browser.reply({ conversationRef: null, projectRef: null, text: '', ...quiet, attachments: [first, second] });
+      assert.deepEqual(fixture.state.rich.uploads, [[first.path, second.path]]);
+      assert.deepEqual(fixture.state.rich.events, ['upload', 'send:2']);
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});
+
+test('a failed upload is a pre-submit failure the bridge may retry, and the retry starts from a freshly loaded page', async () => {
+  await withServer(async fixture => {
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
+    const file = await photo();
+    const conversation = 'https://chatgpt.com/c/existing';
+    try {
+      await browser.start();
+      fixture.state.rich.uploadFails = true;
+      await assert.rejects(browser.reply({ conversationRef: conversation, projectRef: null, text: 'caption', ...quiet, attachments: [file] }), NotSentError);
+      assert.equal(fixture.state.submissions, 0);
+      assert.deepEqual(fixture.state.rich.events, []);
+      const navigations = fixture.state.navigations.length;
+      fixture.state.rich.uploadFails = false;
+      await browser.reply({ conversationRef: conversation, projectRef: null, text: 'caption', ...quiet, attachments: [file] });
+      assert.equal(fixture.state.navigations.length, navigations + 1, 'a half-filled composer is discarded by reloading the conversation');
+      assert.deepEqual(fixture.state.rich.events, ['upload', 'fill:caption', 'send:1']);
+      assert.equal(fixture.state.submissions, 1);
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});
+
+test('a tab that lost its uploads before Send never sends the caption on its own', async () => {
+  await withServer(async fixture => {
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
+    const file = await photo();
+    try {
+      await browser.start();
+      fixture.state.rich.dropAfterPolls = 3;
+      await assert.rejects(browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'caption', ...quiet, attachments: [file] }), /Attachments are not ready/);
+      assert.equal(fixture.state.submissions, 0);
+      assert.equal(fixture.state.rich.events.includes('send:0'), false);
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});
+
+test('the completed reply is delivered as display-ordered blocks with images and files fetched into the media store', async () => {
+  await withServer(async fixture => {
+    const logs: string[] = [];
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: message => { logs.push(message); }, media });
+    const csv = Buffer.from('fruit,color\napple,red\n');
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+    const rich = fixture.state.rich;
+    rich.assets.set(1, { mime: 'text/csv; charset=utf-8', name: 'fruits.csv', bytes: csv });
+    rich.assets.set(2, { mime: 'image/png', name: null, bytes: png });
+    rich.assets.set(3, { error: 'HTTP 404' });
+    rich.media = true;
+    rich.extraction = {
+      url: 'https://chatgpt.com/c/existing', text: 'Completed response',
+      blocks: [
+        { type: 'markdown', text: '## Result' }, { type: 'code', language: 'python', code: 'print(1)' }, { type: 'table', header: ['fruit'], rows: [['apple']] },
+        { type: 'asset', id: 1 }, { type: 'asset', id: 2 }, { type: 'asset', id: 3 },
+      ],
+      assets: [{ id: 1, kind: 'file', name: 'file' }, { id: 2, kind: 'image', name: 'Generated image 1' }, { id: 3, kind: 'file', name: 'broken.csv' }],
+    };
+    try {
+      await browser.start();
+      const reply = await browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Make files', ...quiet });
+      const blocks = reply.blocks ?? [];
+      assert.equal(reply.text, 'Completed response');
+      assert.deepEqual(blocks.slice(0, 3), [{ type: 'markdown', text: '## Result' }, { type: 'code', language: 'python', code: 'print(1)' }, { type: 'table', header: ['fruit'], rows: [['apple']] }]);
+      const file = attachmentOf(blocks[3]);
+      assert.deepEqual({ kind: file.kind, fileName: file.fileName, mimeType: file.mimeType }, { kind: 'document', fileName: 'fruits.csv', mimeType: 'text/csv' });
+      assert.ok(file.path.startsWith(mediaDirectory));
+      assert.deepEqual(await readFile(file.path), csv);
+      const image = attachmentOf(blocks[4]);
+      assert.deepEqual({ kind: image.kind, fileName: image.fileName, mimeType: image.mimeType }, { kind: 'image', fileName: 'Generated image 1.png', mimeType: 'image/png' });
+      assert.deepEqual(await readFile(image.path), png);
+      assert.deepEqual(blocks[5], { type: 'markdown', text: '(could not retrieve broken.csv)' });
+      assert.equal(blocks.length, 6);
+      assert.deepEqual(rich.released, [1, 2, 3]);
+      assert.ok(logs.some(line => /Could not retrieve broken\.csv.*HTTP 404/.test(line)));
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});
+
+test('a reply that is only a generated image completes without any prose', { timeout: 10_000 }, async () => {
+  await withServer(async fixture => {
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
+    const rich = fixture.state.rich;
+    rich.replyText = ''; rich.media = true;
+    rich.assets.set(1, { mime: 'image/png', name: null, bytes: Buffer.from('png bytes') });
+    rich.extraction = { url: 'https://chatgpt.com/c/existing', text: '', blocks: [{ type: 'asset', id: 1 }], assets: [{ id: 1, kind: 'image', name: 'Generated image 1' }] };
+    try {
+      await browser.start();
+      const reply = await browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Draw something', ...quiet });
+      assert.equal(reply.text, '');
+      assert.equal(attachmentOf(reply.blocks?.[0]).kind, 'image');
+      assert.equal(reply.blocks?.length, 1);
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});
+
+test('at most six images or files are delivered per reply and the rest are reported', async () => {
+  await withServer(async fixture => {
+    const logs: string[] = [];
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: message => { logs.push(message); }, media });
+    const rich = fixture.state.rich;
+    rich.media = true;
+    const ids = [1, 2, 3, 4, 5, 6, 7, 8];
+    for (const id of ids) rich.assets.set(id, { mime: 'text/plain', name: `note-${id}.txt`, bytes: Buffer.from(`note ${id}`) });
+    rich.extraction = { url: 'https://chatgpt.com/c/existing', text: 'Completed response', blocks: ids.map(id => ({ type: 'asset', id })), assets: ids.map(id => ({ id, kind: 'file', name: `note-${id}.txt` })) };
+    try {
+      await browser.start();
+      const reply = await browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Many files', ...quiet });
+      const blocks = reply.blocks ?? [];
+      assert.deepEqual(blocks.slice(0, 6).map(block => attachmentOf(block).fileName), [1, 2, 3, 4, 5, 6].map(id => `note-${id}.txt`));
+      assert.deepEqual(blocks.slice(6), [
+        { type: 'markdown', text: '(skipped note-7.txt: more than 6 files in one reply)' },
+        { type: 'markdown', text: '(skipped note-8.txt: more than 6 files in one reply)' },
+      ]);
+      assert.equal(logs.filter(line => /^Skipped note-/.test(line)).length, 2);
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});
+
+for (const [name, extraction] of [
+  ['throws', new Error('page script failed')],
+  ['returns an unexpected shape', { blocks: 'nope' }],
+  ['finds no blocks', { url: 'https://chatgpt.com/c/existing', text: 'Completed response', blocks: [], assets: [] }],
+] as const) {
+  test(`when the rich extraction ${name} the completed reply is still delivered as its plain text`, async () => {
+    await withServer(async fixture => {
+      const logs: string[] = [];
+      const browser = createChatGPT({ endpoint: fixture.endpoint, logger: message => { logs.push(message); }, media });
+      fixture.state.rich.extraction = extraction;
+      try {
+        await browser.start();
+        const reply = await browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Hello', ...quiet });
+        assert.equal(reply.text, 'Completed response');
+        assert.deepEqual(reply.blocks, [{ type: 'markdown', text: 'Completed response' }]);
+        assert.equal(fixture.state.submissions, 1);
+        if (name !== 'finds no blocks') assert.ok(logs.some(line => /Could not read the structure/.test(line)));
+      } finally { await browser.stop().catch(() => undefined); }
+    });
+  });
+}

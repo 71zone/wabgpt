@@ -46,3 +46,42 @@ export function extractText(message: WAMessage): string | undefined {
   const text = content.conversation ?? content.extendedTextMessage?.text;
   return text && text.trim() ? text : undefined;
 }
+
+export interface ImageContent {
+  caption: string;
+  mimeType: string;
+  /** Size the sender declared, when present; the real download is checked separately. */
+  declaredBytes: number | undefined;
+}
+
+function declaredSize(value: { toString(): string } | number | null | undefined): number | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  const size = Number(value.toString());
+  return Number.isFinite(size) ? size : undefined;
+}
+
+/** A photo (image message, or a document whose mime type is an image), including view-once and ephemeral wrappers. */
+export function extractImage(message: WAMessage): ImageContent | undefined {
+  const content = normalizeMessageContent(message.message);
+  if (!content) {
+    return undefined;
+  }
+  const image = content.imageMessage;
+  if (image) {
+    return { caption: image.caption ?? "", mimeType: image.mimetype || "image/jpeg", declaredBytes: declaredSize(image.fileLength) };
+  }
+  const document = content.documentMessage;
+  if (document?.mimetype?.startsWith("image/")) {
+    return { caption: document.caption ?? "", mimeType: document.mimetype, declaredBytes: declaredSize(document.fileLength) };
+  }
+  return undefined;
+}
+
+const IMAGE_EXTENSIONS: Record<string, string> = { "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/heic": "heic", "image/heif": "heif" };
+
+export function imageExtension(mimeType: string): string {
+  const known = IMAGE_EXTENSIONS[mimeType.toLowerCase().split(";")[0]?.trim() ?? ""];
+  return known ?? "img";
+}

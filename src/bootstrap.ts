@@ -7,6 +7,7 @@ import { RoutingState } from './core/state.js';
 import type { LoadedConfig } from './infrastructure/config.js';
 import { routeConsoleOutput } from './infrastructure/console-output.js';
 import { acquireLock } from './infrastructure/lock.js';
+import { createMediaStore } from './infrastructure/media.js';
 
 export interface Runtime { application: Application; close(): Promise<void> }
 
@@ -17,10 +18,11 @@ export interface Runtime { application: Application; close(): Promise<void> }
 export async function createApplication(config: LoadedConfig, options: { notBeforeSeconds?: number } = {}): Promise<Application> {
   let application: Application | undefined;
   const logger = (message: string): void => { application?.log(message); };
-  const assistant = createChatGPT({ endpoint: config.browserMcpUrl, logger });
+  const media = createMediaStore(join(config.dataDir, 'media'));
+  const assistant = createChatGPT({ endpoint: config.browserMcpUrl, logger, media });
   const store = await RoutingState.load(createJsonStatePersistence(config.dataDir), assistant.references);
   const channel = createWhatsApp({
-    authDir: join(config.dataDir, 'whatsapp'), logger,
+    authDir: join(config.dataDir, 'whatsapp'), logger, media,
     onMessage: message => application?.receive(message),
     onStatus: status => application?.setChannelStatus(status),
     onUpdate: () => application?.emit('change'),

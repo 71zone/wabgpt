@@ -1,11 +1,16 @@
-import { isLidUser, isPnUser, jidNormalizedUser } from "@whiskeysockets/baileys";
+import { downloadMediaMessage, isLidUser, isPnUser, jidNormalizedUser } from "@whiskeysockets/baileys";
 import type { BaileysEventMap, WAMessage, WAMessageKey, WASocket } from "@whiskeysockets/baileys";
-import type { IncomingMessage, Logger } from "../../core/contracts.js";
+import { writeFile } from "node:fs/promises";
+import { pino } from "pino";
+import type { Attachment, IncomingMessage, Logger } from "../../core/contracts.js";
+import { MAX_MEDIA_BYTES } from "../../infrastructure/media.js";
+import type { MediaStore } from "../../infrastructure/media.js";
 import type { DirectorySaver } from "./autosave.js";
 import type { LinkState } from "./connection.js";
 import type { Directory } from "./directory.js";
 import type { DirectoryIngest } from "./ingestion.js";
-import { describeError, extractText, isOneToOneUserJid, messageSeconds } from "./protocol.js";
+import { describeError, extractImage, extractText, imageExtension, isOneToOneUserJid, messageSeconds } from "./protocol.js";
+import type { ImageContent } from "./protocol.js";
 
 export interface Inbound {
   /** Subscribes live message upserts; returns the detach function. */
@@ -20,16 +25,26 @@ export interface InboundOptions {
   saver: DirectorySaver;
   link: LinkState;
   logger: Logger;
+  media: MediaStore;
   onMessage: (message: IncomingMessage) => void;
+  /** Fetches and decrypts the bytes of a media message; defaults to Baileys' download through the live socket. */
+  download?: (message: WAMessage) => Promise<Buffer>;
 }
 
 /**
- * Live-only forwarding policy: only `notify` upserts that arrived after this start,
- * from direct contacts, with plain text and not authored by this account, reach `onMessage`.
+ * Live-only forwarding policy: only `notify` upserts that arrived after this start, from direct contacts, with text or a photo
+ * and not authored by this account, reach `onMessage`. Photos are downloaded into the media store first; a photo that cannot be
+ * downloaded is dropped with a log line rather than forwarded without its image.
  * Every direct message (including own and historical ones) still refreshes the chat directory.
  */
 export function createInbound(options: InboundOptions): Inbound {
-  const { directory, ingest, saver, link, logger, onMessage } = options;
+  const { directory, ingest, saver, link, logger, media, onMessage } = options;
+  const baileysLogger = pino({ level: "warn" }, { write: text => logger(`WhatsApp: ${text.trim()}`) });
+  const download = options.download ?? (async (message: WAMessage): Promise<Buffer> => {
+    const socket = link.socket;
+    if (!socket || !link.open) throw new Error("WhatsApp is not connected");
+    return downloadMediaMessage(message, "buffer", {}, { logger: baileysLogger, reuploadRequest: socket.updateMediaMessage });
+  });
   let queue: Promise<void> = Promise.resolve();
 
   async function resolveIncomingJid(message: WAMessage): Promise<string | null> {
@@ -73,12 +88,40 @@ export function createInbound(options: InboundOptions): Inbound {
     saver.schedule();
     const { id, remoteJid } = message.key;
     if (message.key.fromMe || !id || !remoteJid) return;
+    if (sentAt === undefined || sentAt < link.startedAtSeconds) return;
+    const contact = ingest.toContact(directory.records.get(jid) ?? { jid });
+    const image = extractImage(message);
+    if (image) {
+      const attachments = await downloadPhoto(message, id, contact.name, image);
+      if (!attachments) return;
+      onMessage({ id, contact, text: image.caption, attachments, acknowledge: receiptFor({ ...message.key, id, remoteJid }) });
+      return;
+    }
     const text = extractText(message);
-    if (text === undefined || sentAt === undefined || sentAt < link.startedAtSeconds) return;
-    onMessage({
-      id, contact: ingest.toContact(directory.records.get(jid) ?? { jid }), text,
-      acknowledge: receiptFor({ ...message.key, id, remoteJid }),
-    });
+    if (text === undefined) return;
+    onMessage({ id, contact, text, attachments: [], acknowledge: receiptFor({ ...message.key, id, remoteJid }) });
+  }
+
+  /** Saves the photo under the media store; returns undefined (after logging why) when it must not be forwarded. */
+  async function downloadPhoto(message: WAMessage, id: string, contactName: string, image: ImageContent): Promise<Attachment[] | undefined> {
+    if (image.declaredBytes !== undefined && image.declaredBytes > MAX_MEDIA_BYTES) {
+      logger(`Skipped a photo from ${contactName}: ${image.declaredBytes} bytes exceeds the ${MAX_MEDIA_BYTES} byte limit.`);
+      return undefined;
+    }
+    try {
+      const bytes = await download(message);
+      if (bytes.length > MAX_MEDIA_BYTES) {
+        logger(`Skipped a photo from ${contactName}: ${bytes.length} bytes exceeds the ${MAX_MEDIA_BYTES} byte limit.`);
+        return undefined;
+      }
+      const fileName = `${id}.${imageExtension(image.mimeType)}`;
+      const path = await media.allocate(fileName);
+      await writeFile(path, bytes);
+      return [{ kind: "image", path, fileName, mimeType: image.mimeType }];
+    } catch (error) {
+      logger(`Could not download the photo from ${contactName}: ${describeError(error)}`);
+      return undefined;
+    }
   }
 
   function enqueue(messages: WAMessage[]): void {

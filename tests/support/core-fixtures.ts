@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createJsonStatePersistence } from '../../src/adapters/storage/json-state.js';
 import { chatgptReferences } from '../../src/adapters/chatgpt/references.js';
-import type { AssistantAdapter, AssistantReferencePolicy, MessagingAdapter } from '../../src/core/contracts.js';
+import type { AssistantAdapter, AssistantReferencePolicy, MessagingAdapter, ReplyBlock } from '../../src/core/contracts.js';
 import { RoutingState, type PersistedState, type StatePersistence } from '../../src/core/state.js';
 
 export const aliasPair = { alias: '123456789@lid', canonical: '14155551234@s.whatsapp.net' };
@@ -56,17 +56,23 @@ export function memoryPersistence(initial?: unknown): StatePersistence & { write
   };
 }
 
+/** Plain-text view of reply blocks for tests that only care about the words. */
+export function replyText(blocks: ReplyBlock[]): string {
+  return blocks.map(block => block.type === 'markdown' ? block.text : block.type === 'code' ? block.code : block.type === 'table' ? [block.header, ...block.rows].map(row => row.join(' | ')).join('\n') : `[${block.attachment.fileName}]`).join('\n\n');
+}
+
 export const providerNames = { channelName: 'WhatsApp', assistantName: 'ChatGPT' };
 
 /** Inert messaging adapter for core tests; override only what a test observes. */
-export function fakeChannel(overrides: Partial<MessagingAdapter> = {}): MessagingAdapter {
+export function fakeChannel(overrides: Partial<MessagingAdapter> & { sendText?: (contactId: string, text: string) => Promise<void> } = {}): MessagingAdapter {
+  const { sendText, ...rest } = overrides;
   return {
     start: async () => {}, stop: async () => {},
     contacts: () => [], chats: () => [], identities: () => [],
     hasSavedSession: () => false,
     resolveContact: input => { throw new Error(`Unexpected contact lookup: ${input}`); },
-    sendText: async () => {},
-    ...overrides,
+    sendReply: async (contactId, blocks) => { await sendText?.(contactId, replyText(blocks)); },
+    ...rest,
   };
 }
 

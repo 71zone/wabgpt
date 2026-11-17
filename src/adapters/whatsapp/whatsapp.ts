@@ -1,11 +1,13 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { NotSentError, type Contact, type IdentityAlias, type IncomingMessage, type Logger, type MessagingAdapter, type RecentChat } from "../../core/contracts.js";
+import type { Contact, IdentityAlias, IncomingMessage, Logger, MessagingAdapter, RecentChat } from "../../core/contracts.js";
+import type { MediaStore } from "../../infrastructure/media.js";
 import { createDirectorySaver } from "./autosave.js";
 import { createConnection, createLinkState } from "./connection.js";
 import { Directory } from "./directory.js";
 import { createInbound } from "./inbound.js";
 import { createDirectoryIngest } from "./ingestion.js";
+import { createOutbound, type OutboundTiming } from "./outbound.js";
 
 export interface WhatsAppOptions {
   authDir: string;
@@ -18,6 +20,10 @@ export interface WhatsAppOptions {
   onIdentity?: (alias: IdentityAlias) => void;
   /** Forward messages sent at or after this Unix second, so ones queued during a restart are not mistaken for history. */
   notBeforeSeconds?: number;
+  /** Scratch store for downloaded photos and generated files (snippets, CSV tables). */
+  media: MediaStore;
+  /** Overrides pacing and connection waits for replies; tests use it to avoid real delays. */
+  outboundTiming?: Partial<OutboundTiming>;
 }
 
 const DIRECT_NUMBER = /^[1-9]\d{6,14}@s\.whatsapp\.net$/;
@@ -29,7 +35,8 @@ export function createWhatsApp(options: WhatsAppOptions): MessagingAdapter {
   const saver = createDirectorySaver(directory, logger, options.onUpdate);
   const ingest = createDirectoryIngest(directory, { onIdentity: options.onIdentity, changed: saver.schedule });
   const link = createLinkState();
-  const inbound = createInbound({ directory, ingest, saver, link, logger, onMessage });
+  const inbound = createInbound({ directory, ingest, saver, link, logger, onMessage, media: options.media });
+  const sendReply = createOutbound({ link, media: options.media, logger, timing: options.outboundTiming });
   const connection = createConnection({
     authDir, logger, link, directory, ingest, saver, onStatus, onQr: options.onQr, notBeforeSeconds: options.notBeforeSeconds,
     attachListeners: ev => {
@@ -82,11 +89,6 @@ export function createWhatsApp(options: WhatsAppOptions): MessagingAdapter {
       return { id: canonical, name: chat?.name ?? `+${canonical.split("@")[0]}` };
     },
 
-    async sendText(contactId: string, text: string): Promise<void> {
-      if (!link.socket || !link.open) {
-        throw new NotSentError("WhatsApp is not connected");
-      }
-      await link.socket.sendMessage(contactId, { text });
-    },
+    sendReply,
   };
 }

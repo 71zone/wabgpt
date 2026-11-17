@@ -25,6 +25,7 @@ export class Bridge {
   }
   receive(message: IncomingMessage): void {
     if (!this.armed || !this.store.route(message.contact.id)?.enabled) return;
+    if (!message.text.trim() && message.attachments.length === 0) return;
     this.queue = this.queue.then(() => this.forward(message)).catch(error => {
       this.disarm();
       this.logger(`Bridge stopped forwarding: ${error instanceof Error ? error.message : String(error)}`);
@@ -46,6 +47,7 @@ export class Bridge {
         conversationRef: route.conversationRef,
         projectRef: route.projectRef,
         text: message.text,
+        attachments: message.attachments,
         onConversation: ref => this.store.conversation(contactId, ref),
         onSubmitted: async () => {
           accepted = true;
@@ -65,12 +67,12 @@ export class Bridge {
       }), () => this.assistant.start());
       this.logger(`${assistantName} reply ready for ${route.name} after ${Math.round(performance.now() - started)}ms.`);
       await this.store.conversation(contactId, response.conversationRef);
-      if (!response.text.trim()) throw new Error(`${assistantName} returned an empty response.`);
+      const blocks = response.blocks ?? [{ type: 'markdown' as const, text: response.text }];
+      if (!response.text.trim() && !blocks.some(block => block.type === 'attachment')) throw new Error(`${assistantName} returned an empty response.`);
       if (!this.armed || !this.store.route(contactId)?.enabled) throw new Error(`Forwarding paused before reply delivery. Response remains in ${assistantName}.`);
-      if (response.text.length > 60_000) throw new Error(`Response exceeds the ${channelName} text limit. Read it in ${assistantName}.`);
       const sendStarted = performance.now();
       this.logger(`Sending ${channelName} reply to ${route.name}.`);
-      await this.retryUnsent(route.name, channelName, () => this.channel.sendText(contactId, response.text));
+      await this.retryUnsent(route.name, channelName, () => this.channel.sendReply(contactId, blocks));
       await this.store.finish(key, contactId, 'done');
       this.logger(`Reply sent to ${route.name}; ${channelName} send ${Math.round(performance.now() - sendStarted)}ms, total ${Math.round(performance.now() - started)}ms.`);
     } catch (error) {
