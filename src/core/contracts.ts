@@ -43,3 +43,8 @@ export interface AssistantAdapter {
     onSubmitted: () => Promise<void>;
   }): Promise<{ conversationRef: string; text: string }>;
 }
+/**
+ * Thrown by an adapter when it can prove the provider never received the message (not connected, page not ready). Only this error lets
+ * the bridge retry on its own: any other failure may have reached the provider, and repeating it could duplicate the message.
+ */
+export class NotSentError extends Error {}

@@ -14,7 +14,7 @@ export interface Runtime { application: Application; close(): Promise<void> }
  * The only place concrete providers are wired together. Returns an unstarted
  * Application: nothing connects or sends until the caller restores or logs in.
  */
-export async function createApplication(config: LoadedConfig): Promise<Application> {
+export async function createApplication(config: LoadedConfig, options: { notBeforeSeconds?: number } = {}): Promise<Application> {
   let application: Application | undefined;
   const logger = (message: string): void => { application?.log(message); };
   const assistant = createChatGPT({ endpoint: config.browserMcpUrl, logger });
@@ -26,13 +26,18 @@ export async function createApplication(config: LoadedConfig): Promise<Applicati
     onUpdate: () => application?.emit('change'),
     onIdentity: alias => { void application?.linkIdentity(alias).catch(error => logger(error instanceof Error ? error.message : String(error))); },
     onQr: payload => application?.emit('qr', payload),
+    notBeforeSeconds: options.notBeforeSeconds,
   });
   for (const alias of channel.identities()) await store.linkIdentity(alias);
   application = new Application({ configPath: config.path, channelName: 'WhatsApp', assistantName: 'ChatGPT' }, store, channel, assistant);
   return application;
 }
 
-export interface OpenRuntimeOptions { prepare?: (config: LoadedConfig) => Promise<LoadedConfig> }
+export interface OpenRuntimeOptions {
+  prepare?: (config: LoadedConfig) => Promise<LoadedConfig>;
+  /** See WhatsAppOptions.notBeforeSeconds. */
+  notBeforeSeconds?: number;
+}
 
 /**
  * Takes the data directory's single-writer lock for the runtime's lifetime and routes dependency
@@ -49,7 +54,7 @@ export async function openRuntime(config: LoadedConfig, options: OpenRuntimeOpti
   let application: Application;
   try {
     const prepared = options.prepare ? await options.prepare(config) : config;
-    application = await createApplication(prepared);
+    application = await createApplication(prepared, { notBeforeSeconds: options.notBeforeSeconds });
     restoreConsole = routeConsoleOutput(message => application.log(message));
   } catch (error) {
     restoreConsole?.();

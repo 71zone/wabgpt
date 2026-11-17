@@ -6,6 +6,7 @@ import { runTui } from './interfaces/tui/tui.js';
 import { openRuntime } from './bootstrap.js';
 import { parseCommandLine, usage } from './infrastructure/arguments.js';
 import { defaultConfigPath, loadConfig } from './infrastructure/config.js';
+import { RESTART_EXIT_CODE, isSupervised, sessionStartSeconds, superviseRestarts, wasRestarted } from './infrastructure/supervisor.js';
 import { completeOnboarding, createTerminalSetupIO, OnboardingCancelled, prepareOnboarding, type PreparedOnboarding } from './onboarding/index.js';
 
 const help = `wabgpt · WhatsApp ↔ ChatGPT bridge
@@ -22,6 +23,7 @@ L  Connect WhatsApp or show a pairing QR
 R  Resume enabled forwarding sessions
 P  Pause all forwarding
 A  Add an international phone number
+X  Restart wabgpt: finishes any in-progress reply, then relaunches and resumes by itself
 B  Check BrowserOS connectivity and the ChatGPT composer (not proof of login)
 G  Pick or clear the selected contact's ChatGPT project from a searchable list of your projects
 T  Set the selected contact's fixed chat lifetime: 90m, 12h, 3d or never (default 24h)
@@ -94,17 +96,20 @@ async function runTerminal(configPath: string | undefined, force: boolean): Prom
   let plan: PreparedOnboarding = { config, setup: null };
   try {
     const runtime = await openRuntime(config, {
+      notBeforeSeconds: sessionStartSeconds(),
       prepare: async current => {
         plan = await prepareOnboarding(current, { force, io: terminal.io, signal });
         return plan.config;
       },
     });
+    let outcome: 'quit' | 'restart' = 'quit';
     try {
       await completeOnboarding(runtime.application, plan, { io: terminal.io, signal });
       if (signal.aborted) throw signal.reason;
       finishSetupIO();
-      await runTui(runtime.application);
+      outcome = await runTui(runtime.application, { canRestart: isSupervised() });
     } finally { await runtime.close(); }
+    if (outcome === 'restart') process.exitCode = RESTART_EXIT_CODE;
   } catch (error) {
     if (!signal.aborted && !(error instanceof OnboardingCancelled)) throw error;
     stdout.write('\nSetup stopped. Your progress is saved; run "wabgpt" to continue.\n');
@@ -134,7 +139,10 @@ async function main(): Promise<void> {
   if (command === 'help') { stdout.write(help); return; }
   if (command === 'serve') return runServer(config);
   if (command === 'token') return printToken(config);
-  return runTerminal(config, command === 'setup');
+  // A restart relaunches the same command line; setup already ran, so the new process opens the dashboard.
+  const setup = command === 'setup' && !wasRestarted();
+  if (!isSupervised() && stdin.isTTY && stdout.isTTY) process.exitCode = await superviseRestarts();
+  else await runTerminal(config, setup);
 }
 
 main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

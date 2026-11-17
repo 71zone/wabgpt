@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Bridge } from '../src/core/bridge.js';
-import type { AssistantAdapter, IncomingMessage, MessagingAdapter } from '../src/core/contracts.js';
+import { NotSentError, type AssistantAdapter, type IncomingMessage, type MessagingAdapter } from '../src/core/contracts.js';
 import type { RoutingState } from '../src/core/state.js';
 import { fakeAssistant, fakeChannel, loadState, opaqueReferences, projectA, projectB, providerNames, withDirectory } from './support/core-fixtures.js';
 
@@ -38,7 +38,7 @@ test('routes distinct contacts to persistent conversations and suppresses redeli
   });
 });
 
-test('uncertain delivery pauses contact and does not replay its pending messages', async () => {
+test('a failure after the prompt was accepted never replays it but keeps the contact enabled for later messages', async () => {
   await fixture(async store => {
     await store.enable(alice);
     let calls = 0;
@@ -48,10 +48,10 @@ test('uncertain delivery pauses contact and does not replay its pending messages
     const channel = fakeChannel({ sendText: async () => { assert.fail('Must not send on failed generation'); } });
     const bridge = bridgeOf(store, assistant, channel); bridge.arm();
     bridge.receive(incoming('a')); bridge.receive(incoming('b')); await bridge.idle();
-    assert.equal(calls, 1);
-    assert.equal(store.route(alice.id)?.enabled, false);
+    assert.equal(calls, 2);
+    assert.equal(store.route(alice.id)?.enabled, true);
     assert.equal(store.route(alice.id)?.conversationRef, 'https://chatgpt.com/c/retained');
-    await store.enable(alice); bridge.receive(incoming('a')); await bridge.idle(); assert.equal(calls, 1);
+    bridge.receive(incoming('a')); await bridge.idle(); assert.equal(calls, 2);
   });
 });
 
@@ -86,8 +86,7 @@ test('pause during generation prevents the pending reply', async () => {
     await entered.promise;
     bridge.disarm(); release.resolve();
     await bridge.idle();
-    assert.equal(store.route(alice.id)?.enabled, false);
-    assert.match(store.route(alice.id)?.error || '', /paused before reply/);
+    assert.equal(store.route(alice.id)?.enabled, true);
   });
 });
 
@@ -188,7 +187,28 @@ test('log lines and route errors use the configured provider names', async () =>
     const bridge = new Bridge(store, assistant, fakeChannel(), text => logs.push(text), { channelName: 'Chat', assistantName: 'Helper' }); bridge.arm();
     bridge.receive(incoming('named')); await bridge.idle();
     assert.ok(logs.some(line => line.startsWith('Helper accepted the message from Alice after ') && line.endsWith('sending Chat read receipt.')));
-    assert.equal(logs.at(-1), 'Paused Alice: boom Inspect Chat and Helper before enabling again. No automatic replay.');
+    assert.equal(logs.at(-1), 'No reply was delivered to Alice: boom The Helper conversation may still hold the answer; the message was not replayed and Alice stays enabled.');
+  });
+});
+
+test('a message is retried on its own while the provider provably has not received it', async () => {
+  await fixture(async store => {
+    await store.enable(alice);
+    let attempts = 0, repairs = 0, sends = 0;
+    const assistant = fakeAssistant({
+      start: async () => { repairs++; },
+      reply: async input => {
+        attempts++;
+        if (attempts < 3) throw new NotSentError('composer not found');
+        await input.onConversation('https://chatgpt.com/c/retry'); await input.onSubmitted();
+        return { conversationRef: 'https://chatgpt.com/c/retry', text: 'Hi' };
+      },
+    });
+    const channel = fakeChannel({ sendText: async () => { if (++sends < 2) throw new NotSentError('offline'); } });
+    const bridge = bridgeOf(store, assistant, channel); bridge.arm();
+    bridge.receive(incoming('retry')); await bridge.idle();
+    assert.deepEqual({ attempts, repairs, sends }, { attempts: 3, repairs: 2, sends: 2 });
+    assert.equal(store.route(alice.id)?.enabled, true);
   });
 });
 

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { Contact, IdentityAlias, IncomingMessage, Logger, MessagingAdapter, RecentChat } from "../../core/contracts.js";
+import { NotSentError, type Contact, type IdentityAlias, type IncomingMessage, type Logger, type MessagingAdapter, type RecentChat } from "../../core/contracts.js";
 import { createDirectorySaver } from "./autosave.js";
 import { createConnection, createLinkState } from "./connection.js";
 import { Directory } from "./directory.js";
@@ -16,6 +16,8 @@ export interface WhatsAppOptions {
   /** Raw Baileys QR payload to render in the UI; an empty string clears it. */
   onQr?: (qr: string) => void;
   onIdentity?: (alias: IdentityAlias) => void;
+  /** Forward messages sent at or after this Unix second, so ones queued during a restart are not mistaken for history. */
+  notBeforeSeconds?: number;
 }
 
 const DIRECT_NUMBER = /^[1-9]\d{6,14}@s\.whatsapp\.net$/;
@@ -29,7 +31,7 @@ export function createWhatsApp(options: WhatsAppOptions): MessagingAdapter {
   const link = createLinkState();
   const inbound = createInbound({ directory, ingest, saver, link, logger, onMessage });
   const connection = createConnection({
-    authDir, logger, link, directory, ingest, saver, onStatus, onQr: options.onQr,
+    authDir, logger, link, directory, ingest, saver, onStatus, onQr: options.onQr, notBeforeSeconds: options.notBeforeSeconds,
     attachListeners: ev => {
       const detachDirectory = ingest.attach(ev);
       const detachInbound = inbound.attach(ev);
@@ -82,7 +84,7 @@ export function createWhatsApp(options: WhatsAppOptions): MessagingAdapter {
 
     async sendText(contactId: string, text: string): Promise<void> {
       if (!link.socket || !link.open) {
-        throw new Error("WhatsApp is not connected");
+        throw new NotSentError("WhatsApp is not connected");
       }
       await link.socket.sendMessage(contactId, { text });
     },

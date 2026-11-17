@@ -1,7 +1,7 @@
 import { setTimeout } from 'node:timers/promises';
 import { z } from 'zod';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import type { AssistantAdapter, Logger, Project } from '../../core/contracts.js';
+import { NotSentError, type AssistantAdapter, type Logger, type Project } from '../../core/contracts.js';
 import { parseLocalMcpEndpoint } from '../../infrastructure/loopback.js';
 import { isExpiredSession, listPagesPrelude, openMcp, reclaimTabGroup, runScript } from '../browseros/mcp.js';
 import { chatgptInspectionScript, composerName, composerReadyScript, settleScript, submitScript } from './dom.js';
@@ -14,6 +14,10 @@ const inspection = z.object({ url: z.string(), userId: z.string().nullable(), as
 const home = 'https://chatgpt.com/';
 /** Upper bound for closing the catalog's scratch tab after the read ended or was cancelled. */
 const scratchCleanupMs = 5000;
+/** A submitted prompt is abandoned only after ChatGPT shows no progress (not generating, text unchanged, or unreachable) for this long. */
+const IDLE_LIMIT_MS = 5 * 60_000;
+/** Absolute ceiling on one reply, however much progress it shows. */
+const MAX_WAIT_MS = 60 * 60_000;
 
 /**
  * ChatGPT through BrowserOS Neo. A conversation or project reference is its canonical https://chatgpt.com URL, so refs map to the pages the tab visits without translation.
@@ -168,7 +172,9 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
           await run(`const page=browser.page(${pageId}); await page.goto(${JSON.stringify(target)});${settleScript('page', target)} return true;`);
           currentUrl = target;
         };
+        let attempting = false;
         const submit = async () => {
+          attempting = false;
           await ping();
           let navigated = false;
           if (pageId === null) { await openPage(target); navigated = true; }
@@ -179,24 +185,41 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
           if (before.busy) throw new Error('This conversation is already generating a response.');
           if (before.error) throw new Error(`ChatGPT: ${before.error}`);
           if (pageId === null) throw new Error('ChatGPT tab is not open.');
+          attempting = true;
           const sent = await run(submitScript(pageId, pathPattern, input.text));
           submitted = true;
           await remember(z.object({ url: z.string() }).parse(sent).url);
           return before;
         };
         let before;
-        try { before = await submit(); }
-        catch (error) {
-          if (!isExpiredSession(error) || submitted) throw error;
-          reconnected = true; await reconnect(target); before = await submit();
-        }
-        const deadline = Date.now() + 180000;
-        while (Date.now() < deadline) {
-          let observed;
-          try { observed = await inspect(submittedUserId); }
+        try {
+          try { before = await submit(); }
           catch (error) {
-            if (!isExpiredSession(error) || reconnected || !saved) throw error;
-            reconnected = true; await reconnect(saved); continue;
+            if (!isExpiredSession(error) || submitted) throw error;
+            reconnected = true; await reconnect(target); before = await submit();
+          }
+        } catch (error) {
+          // Nothing reached ChatGPT unless the submit click itself was attempted, so the bridge may safely try this same message again.
+          if (attempting || submitted || error instanceof NotSentError) throw error;
+          throw new NotSentError(error instanceof Error ? error.message : String(error), { cause: error });
+        }
+        // Wait for as long as ChatGPT makes progress. A slow answer (long thinking, long generation) is not a failure, and a dropped BrowserOS
+        // connection is retried rather than abandoned; only a page that stays silent for IDLE_LIMIT_MS, or the absolute ceiling, gives up.
+        const startedAt = Date.now();
+        let lastProgress = startedAt;
+        let lastText = '';
+        let lastFailure: unknown;
+        let failures = 0;
+        while (Date.now() - startedAt < MAX_WAIT_MS) {
+          let observed;
+          try { observed = await inspect(submittedUserId); failures = 0; }
+          catch (error) {
+            if (Date.now() - lastProgress >= IDLE_LIMIT_MS) throw error;
+            lastFailure = error; failures++;
+            if (failures === 1 || failures % 10 === 0) options.logger(`Lost contact with ChatGPT (${error instanceof Error ? error.message : String(error)}); retrying. The submitted message is not resent.`);
+            await setTimeout(Math.min(1000 * failures, 10000));
+            try { if ((isExpiredSession(error) || !client) && saved) await reconnect(saved); } catch (reconnectError) { lastFailure = reconnectError; }
+            continue;
           }
           await remember(observed.url);
           if (observed.error) throw new Error(`ChatGPT: ${observed.error}`);
@@ -206,9 +229,12 @@ export function createChatGPT(options: { endpoint: string; logger: Logger }): As
             await input.onSubmitted();
           }
           if (saved && submittedUserId && observed.userId === submittedUserId && observed.assistantId && observed.complete && !observed.busy && observed.text.trim()) return { conversationRef: saved, text: observed.text };
+          if (observed.busy || observed.text !== lastText) { lastProgress = Date.now(); lastText = observed.text; }
+          if (Date.now() - lastProgress >= IDLE_LIMIT_MS) break;
           await setTimeout(1000);
         }
-        throw new Error('ChatGPT response timed out after submission. Inspect the saved conversation; do not resend automatically.');
+        const reason = lastFailure instanceof Error ? ` Last error: ${lastFailure.message}` : '';
+        throw new Error(`ChatGPT response timed out after submission (no progress for ${Math.round(IDLE_LIMIT_MS / 60000)} minutes or over ${Math.round(MAX_WAIT_MS / 60000)} minutes total).${reason} Inspect the saved conversation; do not resend automatically.`);
       } finally { working = false; }
     },
   };

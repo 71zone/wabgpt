@@ -15,11 +15,15 @@ function lifecycle(route: Route | undefined): { project: string | null; ttl: num
   return { project: route?.projectRef ?? null, ttl, conversation, startedAt, expiresAt, expired: expiresAt !== null && Date.now() >= expiresAt };
 }
 
-/** Full-screen terminal dashboard over an unstarted Application. Resolves once the user quits and the application has closed. */
-export async function runTui(application: Application): Promise<void> {
+/**
+ * Full-screen terminal dashboard over an unstarted Application. Resolves once the user quits or restarts and the application has closed;
+ * "restart" is offered only when `canRestart` is set, because the caller must relaunch the process.
+ */
+export async function runTui(application: Application, options: { canRestart?: boolean } = {}): Promise<'quit' | 'restart'> {
   const { channelName, assistantName, configPath } = application.metadata;
   const screen = blessed.screen({ smartCSR: true, fullUnicode: true, title: 'wabgpt', dockBorders: true, warnings: false });
   const done = Promise.withResolvers<void>();
+  let outcome: 'quit' | 'restart' = 'quit';
   const frame = { type: 'line' } satisfies blessed.Widgets.Border;
   const colors = { border: { fg: 'gray' }, focus: { border: { fg: 'cyan' } } };
   const header = blessed.box({ parent: screen, top: 0, left: 0, width: '100%', height: 3, tags: true, padding: { left: 1 } });
@@ -99,10 +103,13 @@ export async function runTui(application: Application): Promise<void> {
       } catch (error) { application.log(errorMessage(error)); }
     });
   }
-  async function shutdown(): Promise<void> {
+  async function shutdown(restart = false): Promise<void> {
     if (closing) return;
     closing = true; picker.close();
-    application.log('Stopping. Saved settings are retained. Waiting for any in-progress operation to finish…');
+    if (restart) outcome = 'restart';
+    application.log(restart
+      ? 'Restarting. Waiting for any in-progress reply to finish, then relaunching; enabled sessions resume on their own…'
+      : 'Stopping. Saved settings are retained. Waiting for any in-progress operation to finish…');
     try { await application.close(); }
     catch (error) { activity.log(clean(errorMessage(error))); }
     finally {
@@ -120,7 +127,8 @@ export async function runTui(application: Application): Promise<void> {
   toolbar('B Browser', 12, () => application.checkBrowser());
   toolbar('G Project', 12, setProject);
   toolbar('T TTL', 9, setTtl);
-  toolbar('Q Quit', 10, shutdown);
+  if (options.canRestart) toolbar('X Restart', 13, () => shutdown(true));
+  toolbar('Q Quit', 10, () => shutdown());
 
   function selected(): Contact | undefined {
     if (activePanel === 'sessions') {
@@ -251,7 +259,8 @@ export async function runTui(application: Application): Promise<void> {
     screen.key(keys, () => { if (!modalActive) attempt(action); });
   };
   bind(['l'], () => application.login()); bind(['r'], () => application.resume()); bind(['p'], () => application.pause());
-  bind(['a'], addContact); bind(['b'], () => application.checkBrowser()); bind(['q'], shutdown);
+  bind(['a'], addContact); bind(['b'], () => application.checkBrowser()); bind(['q'], () => shutdown());
+  if (options.canRestart) bind(['x'], () => shutdown(true));
   bind(['g'], setProject); bind(['t'], setTtl);
   screen.key(['C-c'], () => { void shutdown(); });
   bind(['space', 'enter'], () => {
@@ -276,4 +285,5 @@ export async function runTui(application: Application): Promise<void> {
   onLog(`Saved directory and forwarding sessions loaded. Press L to log in to ${channelName}, Space to enable a selected chat.`);
   attempt(() => application.restore());
   await done.promise;
+  return outcome;
 }

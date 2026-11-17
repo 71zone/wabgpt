@@ -36,6 +36,7 @@ What each panel's data means: [Conversations](../concepts/conversations.md), [De
 | B | Check that BrowserOS is reachable and a ChatGPT composer is available, without sending a prompt (a signed-out page can still show one; the project picker reports a signed-out login) |
 | G | Open the searchable ChatGPT project picker for the selected contact (see below) |
 | T | Set the selected contact's fixed conversation lifetime: minutes, `90m`, `12h`, `3d` or `never`; empty means 24h |
+| X | Restart wabgpt in the same terminal. It waits for any in-progress reply to finish, releases the data-directory lock, and a fresh process starts and resumes enabled sessions without pressing R. The new process picks up a rebuilt `dist/` or a changed config. WhatsApp allows one connection per linked device, so there is a gap of a few seconds while it relaunches; messages sent during the gap are forwarded once it reconnects. A message that arrives while the old process is still finishing a reply is not forwarded. |
 | Q or Ctrl-C | Quit and retain settings |
 
 Toolbar buttons also accept mouse clicks. Buttons and keys are ignored while an input prompt, the project picker or the QR overlay is open. Escape hides a QR overlay, cancels a prompt or picker, or clears a search.

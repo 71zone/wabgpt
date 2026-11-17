@@ -30,6 +30,7 @@ export class Application extends EventEmitter<{ change: []; log: [message: strin
   private closing: Promise<void> | null = null;
   private closed = false;
   private generation = 0;
+  private healTimer: NodeJS.Timeout | undefined;
   private channelStatus = 'disconnected';
   private assistantStatus = 'disconnected';
 
@@ -62,7 +63,28 @@ export class Application extends EventEmitter<{ change: []; log: [message: strin
       channelStatus: this.channelStatus, assistantStatus: this.assistantStatus,
     };
   }
+  /**
+   * Self-healing watchdog. Forwarding the user asked for (the saved running flag) must not stay off because a dependency blipped: whenever it is
+   * disarmed, whether BrowserOS was unreachable at launch, the channel failed, or an unexpected error stopped the bridge, it resumes on its own
+   * with backoff from 15s to 5min. Only a logged-out channel is left alone, since it needs a human to scan a QR code. Explicit pause() clears the flag.
+   */
+  private watch(failures = 0): void {
+    if (this.closed) return;
+    const delay = Math.min(15_000 * 2 ** failures, 300_000);
+    this.healTimer = setTimeout(() => void this.heal(failures), delay);
+    this.healTimer.unref();
+  }
+  private async heal(failures: number): Promise<void> {
+    this.healTimer = undefined;
+    if (this.closed) return;
+    const needed = this.store.isRunning() && !this.bridge.isArmed() && !this.resumeAttempt && this.channelStatus !== 'logged-out' && this.store.routes().some(route => route.enabled);
+    if (!needed) return this.watch(0);
+    this.log('Forwarding is enabled but stopped. Repairing the connections and resuming on its own.');
+    try { await this.resume(); this.watch(0); }
+    catch (error) { this.log(`Repair attempt failed: ${message(error)} Trying again automatically.`); this.watch(failures + 1); }
+  }
   async restore(): Promise<void> {
+    this.watch();
     if (this.store.isRunning() && this.store.routes().some(route => route.enabled)) {
       this.log(`Restoring saved forwarding sessions and their ${this.metadata.assistantName} conversations.`);
       await this.resume();
@@ -179,6 +201,7 @@ export class Application extends EventEmitter<{ change: []; log: [message: strin
   close(): Promise<void> {
     this.closing ??= (async () => {
       this.closed = true; this.generation++; this.bridge.disarm();
+      clearTimeout(this.healTimer);
       this.catalog.cancel(new Error('wabgpt is closing.'));
       await this.resumeAttempt?.catch(() => undefined);
       await this.assistantAttempt?.catch(() => undefined);

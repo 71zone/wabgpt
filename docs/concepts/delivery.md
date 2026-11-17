@@ -26,11 +26,19 @@ The response reader matches stable user and assistant message IDs within the sam
 
 ## Reconnects and uncertain acceptance
 
+A linked WhatsApp device reconnects on its own after network drops, sleep or VPN changes. It retries with backoff that grows to one attempt every 30 seconds and keeps going until the connection returns, so forwarding stays active and resumes without pressing R. The bridge stops retrying only when reconnecting cannot help: the device was logged out, another client replaced this session, or WhatsApp refused the device. Before the first QR pairing completes, it gives up after 8 attempts.
+
 The bridge checks the MCP connection before submitting each prompt and when you press B. If BrowserOS rejects an expired session with HTTP 404, the bridge creates a new MCP session and reuses its recorded tab and group instead of opening a duplicate ChatGPT tab, with at most one recovery attempt per message. If expiry happens after submission, it resumes observation only when the conversation URL is known. An uncertain submission is never automatically repeated.
 
-## Errors and pausing
+## Self-healing and errors
 
-If generation or delivery fails, the affected session pauses. Inspect both conversations before enabling it again. Failed messages are not automatically replayed, because a remote service may have accepted a message before the connection failed. Interrupted deliveries are quarantined on restart. The bridge cannot promise exactly-once delivery across two remote services.
+The bridge repairs itself rather than waiting for you to press R or re-enable a session.
+
+- **Not yet sent:** if ChatGPT is not ready before the prompt is submitted (BrowserOS down, tab or composer missing, conversation still generating), or WhatsApp is offline when the reply is ready, the same message is retried with backoff up to 30 seconds for up to 30 minutes. Between attempts the bridge reconnects BrowserOS. This is safe because the provider provably never received the message.
+- **Slow replies:** the bridge keeps waiting while ChatGPT is generating or the text is changing. It gives up only after 5 minutes without progress or 60 minutes in total, and retries lost BrowserOS connections the whole time.
+- **Stopped forwarding:** while the saved running flag is on, a watchdog resumes forwarding whenever it becomes disarmed (BrowserOS unreachable at launch, channel failure, an unexpected bridge error), with backoff from 15 seconds to 5 minutes. A logged-out WhatsApp device still needs a QR scan.
+- **After acceptance:** if ChatGPT accepted the prompt but no reply could be read or sent, the prompt is never replayed, because that could duplicate it. The session stays enabled and later messages flow. The answer may still be in the saved ChatGPT conversation.
+- **Unknown failures before acceptance:** the session pauses, and you inspect both conversations before enabling it again. Interrupted deliveries are quarantined on restart. The bridge cannot promise exactly-once delivery across two remote services.
 
 Pausing prevents any pending WhatsApp reply from being sent but cannot retract a prompt already submitted to ChatGPT. Quitting disarms forwarding and waits for an in-progress browser operation to finish before closing.
 

@@ -25,7 +25,7 @@ export async function serveUntilStopped({ runtime, settings, stopped, output }: 
     output(`wabgpt dashboard listening on ${server.url}\nSign in with the owner token from "wabgpt token".\n`);
     if (!stopping) {
       const restored = application.restore().catch(error => {
-        application.log(`Saved forwarding could not resume: ${error instanceof Error ? error.message : String(error)} The dashboard is still running; fix the browser, then use Resume.`);
+        application.log(`Saved forwarding could not resume: ${error instanceof Error ? error.message : String(error)} The dashboard is still running and will keep retrying on its own; fixing the browser sooner just makes it recover sooner.`);
       });
       await Promise.race([restored, stopped]);
     }

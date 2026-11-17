@@ -8,8 +8,11 @@ import type { Directory } from "./directory.js";
 import type { DirectoryIngest } from "./ingestion.js";
 import { describeError, disconnectStatusCode } from "./protocol.js";
 
-const MAX_RECONNECT_ATTEMPTS = 8;
+/** Attempts allowed before the first pairing completes, so an unscanned QR does not loop forever. */
+const MAX_PAIRING_ATTEMPTS = 8;
 const MAX_BACKOFF_MS = 30_000;
+/** Another client took over, or WhatsApp refused this device: reconnecting cannot help. */
+const FATAL_CODES = new Set<number>([DisconnectReason.connectionReplaced, DisconnectReason.forbidden, DisconnectReason.multideviceMismatch]);
 
 /** Live socket facts owned by the connection and read by the inbound pipeline and sender. */
 export interface LinkState {
@@ -35,6 +38,8 @@ export interface ConnectionOptions {
   drainInbound: () => Promise<void>;
   onStatus: (status: string) => void;
   onQr: ((qr: string) => void) | undefined;
+  /** Messages sent before this Unix second are history and are not forwarded; defaults to each start() time. */
+  notBeforeSeconds?: number;
 }
 
 export interface Connection {
@@ -42,7 +47,7 @@ export interface Connection {
   stop(): Promise<void>;
 }
 
-/** Baileys socket lifecycle: connect, bounded reconnect with backoff, QR/open notifications and logged-out cleanup. */
+/** Baileys socket lifecycle: connect, reconnect with capped backoff until stopped, QR/open notifications and logged-out cleanup. */
 export function createConnection(options: ConnectionOptions): Connection {
   const { authDir, logger, link, directory, ingest, saver, onStatus } = options;
   const baileysLogger = pino({ level: "warn" }, { write: text => logger(`WhatsApp: ${text.trim()}`) });
@@ -54,6 +59,7 @@ export function createConnection(options: ConnectionOptions): Connection {
   let finished = false;
   let everOpened = false;
   let attempts = 0;
+  let paired = false;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let identityLookup: Promise<void> = Promise.resolve();
   const pendingSaves = new Set<Promise<void>>();
@@ -111,22 +117,37 @@ export function createConnection(options: ConnectionOptions): Connection {
       handleLoggedOut();
       return;
     }
+    if (code !== undefined && FATAL_CODES.has(code)) {
+      fail(new Error(`WhatsApp connection closed (${describeError(error)}, code ${code}); reconnecting cannot fix this. Log in again after resolving it.`));
+      return;
+    }
     // After the QR scan WhatsApp requires one immediate restart; it is not a failure.
     const immediate = code === DisconnectReason.restartRequired;
     if (!immediate) attempts += 1;
-    if (attempts > MAX_RECONNECT_ATTEMPTS) {
-      fail(new Error(`WhatsApp connection lost (${describeError(error)}); gave up after ${MAX_RECONNECT_ATTEMPTS} reconnect attempts.`));
+    // A paired device keeps retrying through network outages, sleep and VPN changes; only an unpaired QR flow gives up.
+    if (!paired && attempts > MAX_PAIRING_ATTEMPTS) {
+      fail(new Error(`WhatsApp connection lost (${describeError(error)}); gave up after ${MAX_PAIRING_ATTEMPTS} attempts before pairing completed.`));
       return;
     }
     const delay = immediate ? 0 : Math.min(1000 * 2 ** (attempts - 1), MAX_BACKOFF_MS);
-    onStatus(`reconnecting (attempt ${attempts}/${MAX_RECONNECT_ATTEMPTS}, code ${code ?? "unknown"})`);
+    onStatus(`reconnecting (attempt ${attempts}, code ${code ?? "unknown"})`);
     logger(`WhatsApp disconnected (${describeError(error)}); reconnecting in ${delay}ms.`);
     teardownSocket();
+    scheduleReconnect(delay);
+  }
+
+  function scheduleReconnect(delay: number): void {
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect().catch((connectError: unknown) => {
         if (stopping || finished) return;
-        fail(new Error(`WhatsApp reconnect failed: ${describeError(connectError)}`));
+        if (!paired) {
+          fail(new Error(`WhatsApp reconnect failed: ${describeError(connectError)}`));
+          return;
+        }
+        attempts += 1;
+        logger(`WhatsApp reconnect failed (${describeError(connectError)}); retrying in ${MAX_BACKOFF_MS}ms.`);
+        scheduleReconnect(MAX_BACKOFF_MS);
       });
     }, delay);
   }
@@ -183,6 +204,8 @@ export function createConnection(options: ConnectionOptions): Connection {
   async function connect(): Promise<void> {
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     await chmod(authDir, 0o700);
+    // QR pairing leaves `registered` false; `me` is set once this device is linked.
+    paired = Boolean(state.creds.me?.id) || everOpened;
     if (stopping || finished) return;
     const current = makeWASocket({
       auth: state,
@@ -206,7 +229,7 @@ export function createConnection(options: ConnectionOptions): Connection {
       finished = false;
       everOpened = false;
       attempts = 0;
-      link.startedAtSeconds = Math.floor(Date.now() / 1000);
+      link.startedAtSeconds = options.notBeforeSeconds ?? Math.floor(Date.now() / 1000);
       await authCleanup;
       if (stopping) {
         throw new Error("WhatsApp adapter stopped before the connection opened");
