@@ -11,8 +11,8 @@ export interface Attachment { kind: AttachmentKind; path: string; fileName: stri
  */
 export type ReplyBlock =
   | { type: 'markdown'; text: string }
-  /** A draft the user is meant to copy and send (an email or message); delivered as its own message, Markdown formatted, without the card's label. */
-  | { type: 'draft'; text: string }
+  /** A draft the user is meant to copy and send. `title` is its subject line (email drafts). Delivered as separate messages for the title and the body so each copies cleanly. */
+  | { type: 'draft'; title?: string; text: string }
   | { type: 'code'; language: string | null; code: string }
   | { type: 'table'; header: string[]; rows: string[][] }
   | { type: 'attachment'; attachment: Attachment };

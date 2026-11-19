@@ -158,7 +158,7 @@ test('an email card keeps paragraphs, bold, italics, line breaks and bullet list
   const header = `<div class="flex"><div class="min-w-0">Leave Request for Friday</div></div><div class="flex"><button type="button" aria-label="Copy"><svg></svg></button><fieldset class="contents"><button type="button" aria-label="Open email in app"><svg></svg></button><button type="button" aria-label="Send as me@example.com"><svg></svg>Send</button></fieldset></div>`;
   const reply = `${writingCard('email', header, body, 'copy')}${text('Tone: formal.')}`;
   assert.deepEqual(parse(run(textTurn(reply), chatgptExtractionScript)).blocks, [
-    { type: 'draft', text: "Subject: Leave Request for Friday\n\nDear [Manager's Name],\n\nTo ensure a smooth **handover**, I will:\n\n- Finish all *priority* work.\n- Share updates.\n\nBest regards,\n[Your Name]" },
+    { type: 'draft', title: 'Leave Request for Friday', text: "Dear [Manager's Name],\n\nTo ensure a smooth **handover**, I will:\n\n- Finish all *priority* work.\n- Share updates.\n\nBest regards,\n[Your Name]" },
     { type: 'markdown', text: 'Tone: formal.' },
   ]);
 });

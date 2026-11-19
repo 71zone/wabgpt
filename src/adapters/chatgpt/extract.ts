@@ -95,12 +95,18 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
   let quote = '';
   // A writing card's body is collected as its own draft block: while drafting is set, flush() labels the pending Markdown as a draft instead of prose.
   let drafting = false;
+  let draftTitle = '';
   const addMarkdown = (text) => {
     if (!text.trim()) return;
     pending.push(quote ? text.split('\n').map(line => (quote + line).trimEnd()).join('\n') : text);
   };
   const flush = () => {
-    if (pending.length) blocks.push({ type: drafting ? 'draft' : 'markdown', text: pending.join('\n\n') });
+    if (pending.length) {
+      const text = pending.join('\n\n');
+      if (!drafting) blocks.push({ type: 'markdown', text });
+      else if (draftTitle) { blocks.push({ type: 'draft', title: draftTitle, text }); draftTitle = ''; }
+      else blocks.push({ type: 'draft', text });
+    }
     pending = [];
   };
   const addBlock = (block) => { flush(); blocks.push(block); };
@@ -230,15 +236,16 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
     flush();
     drafting = true;
     const title = cardTitle(card);
-    if (title && surface.getAttribute('data-writing-block-variant') === 'email') addMarkdown('Subject: ' + title);
-    const hadSubject = pending.length;
+    if (title && surface.getAttribute('data-writing-block-variant') === 'email') draftTitle = title;
+    const before = blocks.length;
     if (body) for (const part of itemsOf(body)) emit(part);
-    if (pending.length === hadSubject) {
+    if (blocks.length === before && !pending.length) {
       const copy = (card.matches('[data-markdown-copy-text]') ? card : card.querySelector('[data-markdown-copy-text]'))?.getAttribute('data-markdown-copy-text');
       if (copy) addMarkdown(copy.trim());
     }
     flush();
     drafting = false;
+    draftTitle = '';
   };
 
   const emit = (item) => {
@@ -274,7 +281,7 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
 
 const rawBlock = z.discriminatedUnion('type', [
   z.object({ type: z.literal('markdown'), text: z.string() }),
-  z.object({ type: z.literal('draft'), text: z.string() }),
+  z.object({ type: z.literal('draft'), title: z.string().optional(), text: z.string() }),
   z.object({ type: z.literal('code'), language: z.string().nullable(), code: z.string() }),
   z.object({ type: z.literal('table'), header: z.array(z.string()), rows: z.array(z.array(z.string())) }),
   z.object({ type: z.literal('asset'), id: z.number() }),

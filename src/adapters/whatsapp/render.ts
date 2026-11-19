@@ -25,6 +25,7 @@ const STASH_OPEN = "\uF000";
 const STASH_CLOSE = "\uF001";
 const FENCE_LINE = /^\s*(```|~~~)/;
 const RESERVE_FOR_FENCES = 8;
+const DRAFT_TITLE_LABEL = "_Subject_";
 
 const EXTENSIONS: ReadonlyMap<string, string> = new Map([
   ["javascript", "js"], ["js", "js"], ["jsx", "jsx"], ["typescript", "ts"], ["ts", "ts"], ["tsx", "tsx"], ["python", "py"], ["py", "py"],
@@ -259,9 +260,13 @@ function planTable(block: Extract<ReplyBlock, { type: "table" }>): PlannedMessag
   return planned;
 }
 
-/** A draft is plain WhatsApp-formatted text in messages of its own, so long-press copy yields the draft alone. */
+/** A draft is plain WhatsApp-formatted text in messages of its own, so long-press copy yields the draft alone. A subject gets an italic label bubble and its own bubble. */
 function planDraft(block: Extract<ReplyBlock, { type: "draft" }>): PlannedMessage[] {
-  return splitText(markdownToWhatsApp(block.text)).map((text) => ({ kind: "text", text }));
+  const planned: PlannedMessage[] = [];
+  const title = block.title?.trim();
+  if (title) planned.push({ kind: "text", text: DRAFT_TITLE_LABEL }, { kind: "text", text: title });
+  for (const text of splitText(markdownToWhatsApp(block.text))) planned.push({ kind: "text", text });
+  return planned;
 }
 
 /** Pure planning step: turns reply blocks into ordered WhatsApp messages without touching the disk. */

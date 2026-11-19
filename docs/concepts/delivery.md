@@ -40,7 +40,7 @@ The bridge checks the MCP connection before submitting each prompt and when you 
 |---|---|
 | Prose, headings, lists, quotes, links | WhatsApp formatting (`*bold*`, `_italic_`, `~strike~`, `- ` lists), split into messages of at most 4000 characters |
 | Code block | Its own message holding only the fenced code, so long-press copy gives clean code. Over 12000 characters it is sent as a `snippet.<ext>` document |
-| Writing card (a draft email or message in a bordered card with a Copy button) | Its own WhatsApp-formatted message holding only the draft, without the card label, so long-press copy gives the draft alone; an email card starts with its `Subject:` line. The prose before and after the card stay separate messages, in order |
+| Writing card (a draft email or message in a bordered card with a Copy button) | Its own WhatsApp-formatted message holding only the draft, without the card label, so long-press copy gives the draft alone. An email card arrives as three messages: an italic `_Subject_` label, the subject text alone, and the email body alone. The prose before and after the card stay separate messages, in order |
 | Table | Its own message with an aligned monospace grid when it fits a phone (at most 40 characters wide and 30 rows); otherwise one record per row. Tables with more than 8 rows or that do not fit also arrive as `table.csv`, which opens in Excel or Sheets |
 | Generated image or file | Native WhatsApp image or document, in its position in the reply |
 

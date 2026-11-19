@@ -136,6 +136,19 @@ test('a draft is its own plain WhatsApp message between the prose around it; bol
   assert.ok(long.length > 1 && long.every(message => message.kind === 'text' && message.text.length <= 4000));
 });
 
+test('an email draft arrives as a label bubble, a bubble with only the subject and the body in its own bubbles', () => {
+  const messages = planReply([
+    { type: 'markdown', text: 'Here is the email:' },
+    { type: 'draft', title: 'Leave Request for Friday', text: 'Dear **boss**,\n\nPlease approve.' },
+    { type: 'markdown', text: 'Tone: formal' },
+  ]);
+  assert.deepEqual(messages.map(message => message.kind === 'text' ? message.text : '[other]'), [
+    'Here is the email:', '_Subject_', 'Leave Request for Friday', 'Dear *boss*,\n\nPlease approve.', 'Tone: formal',
+  ]);
+  const long = planReply([{ type: 'draft', title: 'S', text: Array.from({ length: 10 }, (_, index) => `${index}`.repeat(900)).join('\n\n') }]);
+  assert.ok(long.length > 3 && long.slice(2).every(message => message.kind === 'text' && message.text.length <= 4000));
+});
+
 test('long prose splits on paragraph, line and word boundaries within 4000 characters', () => {
   const paragraphs = Array.from({ length: 10 }, (_, index) => `${index}`.repeat(900));
   const chunks = splitText(paragraphs.join('\n\n'));
