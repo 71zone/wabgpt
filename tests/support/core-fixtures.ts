@@ -58,7 +58,7 @@ export function memoryPersistence(initial?: unknown): StatePersistence & { write
 
 /** Plain-text view of reply blocks for tests that only care about the words. */
 export function replyText(blocks: ReplyBlock[]): string {
-  return blocks.map(block => block.type === 'markdown' ? block.text : block.type === 'code' ? block.code : block.type === 'table' ? [block.header, ...block.rows].map(row => row.join(' | ')).join('\n') : `[${block.attachment.fileName}]`).join('\n\n');
+  return blocks.map(block => block.type === 'markdown' || block.type === 'draft' ? block.text : block.type === 'code' ? block.code : block.type === 'table' ? [block.header, ...block.rows].map(row => row.join(' | ')).join('\n') : `[${block.attachment.fileName}]`).join('\n\n');
 }
 
 export const providerNames = { channelName: 'WhatsApp', assistantName: 'ChatGPT' };

@@ -124,6 +124,18 @@ test('mixed blocks keep their order and consecutive prose merges', async () => {
   assert.deepEqual(planReply([{ type: 'attachment', attachment: image }]), [{ kind: 'media', attachment: image }]);
 });
 
+test('a draft is its own plain WhatsApp message between the prose around it; bold and italics convert and long drafts split', () => {
+  const messages = planReply([
+    { type: 'markdown', text: 'Here is a draft:' },
+    { type: 'draft', text: 'Hi **team**,\n\n- *one*\n- two' },
+    { type: 'markdown', text: '**Tone:** friendly' },
+    { type: 'draft', text: '  ' },
+  ]);
+  assert.deepEqual(messages.map(message => message.kind === 'text' ? message.text : '[other]'), ['Here is a draft:', 'Hi *team*,\n\n- _one_\n- two', '*Tone:* friendly']);
+  const long = planReply([{ type: 'draft', text: Array.from({ length: 10 }, (_, index) => `${index}`.repeat(900)).join('\n\n') }]);
+  assert.ok(long.length > 1 && long.every(message => message.kind === 'text' && message.text.length <= 4000));
+});
+
 test('long prose splits on paragraph, line and word boundaries within 4000 characters', () => {
   const paragraphs = Array.from({ length: 10 }, (_, index) => `${index}`.repeat(900));
   const chunks = splitText(paragraphs.join('\n\n'));

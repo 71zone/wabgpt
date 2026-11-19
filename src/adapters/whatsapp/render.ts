@@ -259,6 +259,11 @@ function planTable(block: Extract<ReplyBlock, { type: "table" }>): PlannedMessag
   return planned;
 }
 
+/** A draft is plain WhatsApp-formatted text in messages of its own, so long-press copy yields the draft alone. */
+function planDraft(block: Extract<ReplyBlock, { type: "draft" }>): PlannedMessage[] {
+  return splitText(markdownToWhatsApp(block.text)).map((text) => ({ kind: "text", text }));
+}
+
 /** Pure planning step: turns reply blocks into ordered WhatsApp messages without touching the disk. */
 export function planReply(blocks: ReplyBlock[]): PlannedMessage[] {
   const planned: PlannedMessage[] = [];
@@ -276,6 +281,7 @@ export function planReply(blocks: ReplyBlock[]): PlannedMessage[] {
     flushProse();
     if (block.type === "code") planned.push(...planCode(block));
     else if (block.type === "table") planned.push(...planTable(block));
+    else if (block.type === "draft") planned.push(...planDraft(block));
     else planned.push({ kind: "media", attachment: block.attachment });
   }
   flushProse();

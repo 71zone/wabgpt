@@ -4,7 +4,8 @@ import { locateAssistant } from './dom.js';
 /**
  * Page script (BrowserOS evaluateInPage) that converts the assistant message of the newest turn, or of `targetUserId`, into display-ordered blocks.
  * It is separate from the inspection poll because it walks the whole message. Prose becomes Markdown (rebuilt from the DOM, since ChatGPT's own
- * "copy" output is not reachable), fenced code and tables become their own blocks, and generated images and downloadable files become `asset` blocks.
+ * "copy" output is not reachable), fenced code and tables become their own blocks, writing cards become `draft` blocks, and generated images and
+ * downloadable files become `asset` blocks.
  * Each asset element is stamped with `data-wab-asset="<id>"` so the later byte-transfer scripts can find it.
  *
  * DOM facts it relies on (ChatGPT's DIL renderer, observed live):
@@ -15,6 +16,10 @@ import { locateAssistant } from './dom.js';
  *   (`.cm-content` -> `cmTile.view` or `cmView.view`); other blocks are a plain `pre > code`.
  * - Links carry `?utm_source=chatgpt.com`; `sandbox:` files are `span[role="link"]` inline plus a card (outside the prose) with a "Download file" button.
  * - A generated image is `[data-testid="generated-image-gallery"] img` with a `blob:` source, outside the prose.
+ * - A writing card (an email or message draft the user would copy and send) is `[data-client-defined-widget="writing_block"]` around a
+ *   `[data-testid="chatgpt-writing-block"]` surface with `data-writing-block-variant` ("chat_message", "email", ...), a `header` (label such as
+ *   "Writing", or the subject line for an email, plus Copy / Open editor / Send buttons), and the draft as a ProseMirror editor (p, ul, strong, em,
+ *   br). The surface also carries ChatGPT's own Markdown copy text in `data-markdown-copy-text`. Prose around the card is a sibling of the widget.
  */
 export const chatgptExtractionScript = String.raw`(targetUserId) => {
   ${locateAssistant}
@@ -31,7 +36,8 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
   const SKIP = '[hidden],[aria-hidden="true"],[data-markdown-copy="exclude"],style,script,svg,button:not([aria-label="Download file"]),aside,[role="alert"]';
   const HEADINGS = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
   const CODE = '[data-client-defined-widget="code_block"],[data-code-block],pre';
-  const BLOCKS = 'p,ul,ol,table,blockquote,hr,' + HEADINGS.join(',') + ',' + CODE + ',[data-testid="generated-image-gallery"],button[aria-label="Download file"],img';
+  const CARD = '[data-client-defined-widget="writing_block"],[data-testid="chatgpt-writing-block"],[data-oai-writing-block-surface]';
+  const BLOCKS = 'p,ul,ol,table,blockquote,hr,' + HEADINGS.join(',') + ',' + CODE + ',' + CARD + ',[data-testid="generated-image-gallery"],button[aria-label="Download file"],img';
   const collapse = (text) => text.replace(/\s+/g, ' ');
   const tagOf = (el) => el.tagName.toLowerCase();
 
@@ -87,15 +93,26 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
   const blocks = [];
   let pending = [];
   let quote = '';
+  // A writing card's body is collected as its own draft block: while drafting is set, flush() labels the pending Markdown as a draft instead of prose.
+  let drafting = false;
   const addMarkdown = (text) => {
     if (!text.trim()) return;
     pending.push(quote ? text.split('\n').map(line => (quote + line).trimEnd()).join('\n') : text);
   };
   const flush = () => {
-    if (pending.length) blocks.push({ type: 'markdown', text: pending.join('\n\n') });
+    if (pending.length) blocks.push({ type: drafting ? 'draft' : 'markdown', text: pending.join('\n\n') });
     pending = [];
   };
   const addBlock = (block) => { flush(); blocks.push(block); };
+
+  // Header label of a card ("Writing"); for an email card it is the subject line. Copy and edit buttons carry no text, the send button does.
+  const cardTitle = (card) => {
+    const head = card.querySelector('header');
+    if (!head) return '';
+    const copy = head.cloneNode(true);
+    for (const node of Array.from(copy.querySelectorAll('button,fieldset,svg'))) node.remove();
+    return collapse(copy.textContent).trim();
+  };
 
   const codeBlock = (el) => {
     const widget = el.matches('[data-code-block]') ? el : (el.querySelector('[data-code-block]') || el);
@@ -205,6 +222,25 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
     drain();
   };
 
+  // A writing card (email or message draft with a header label and a copy button) becomes its own draft block between the prose around it. Its body is
+  // a ProseMirror document read like prose; ChatGPT's own copy text on the card is the fallback when the body has nothing readable.
+  const addCard = (card) => {
+    const surface = card.matches('[data-writing-block-variant]') ? card : (card.querySelector('[data-writing-block-variant]') || card);
+    const body = card.querySelector('[data-markdown-copy-content],.ProseMirror');
+    flush();
+    drafting = true;
+    const title = cardTitle(card);
+    if (title && surface.getAttribute('data-writing-block-variant') === 'email') addMarkdown('Subject: ' + title);
+    const hadSubject = pending.length;
+    if (body) for (const part of itemsOf(body)) emit(part);
+    if (pending.length === hadSubject) {
+      const copy = (card.matches('[data-markdown-copy-text]') ? card : card.querySelector('[data-markdown-copy-text]'))?.getAttribute('data-markdown-copy-text');
+      if (copy) addMarkdown(copy.trim());
+    }
+    flush();
+    drafting = false;
+  };
+
   const emit = (item) => {
     if (item.nodes) {
       if (inProse(item)) addMarkdown(paragraph(item.nodes, true));
@@ -216,6 +252,7 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
     if (tag === 'img') { addImage(el); return; }
     if (tag === 'button') { addAsset(el, 'file', fileName(el)); return; }
     if (!inProse(item)) return;
+    if (el.matches(CARD)) { addCard(el); return; }
     if (el.matches(CODE)) { const block = codeBlock(el); if (block.code.trim()) addBlock(block); return; }
     if (tag === 'table') { const block = tableBlock(el); if (block) addBlock(block); return; }
     if (tag === 'hr') addMarkdown('---');
@@ -237,6 +274,7 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
 
 const rawBlock = z.discriminatedUnion('type', [
   z.object({ type: z.literal('markdown'), text: z.string() }),
+  z.object({ type: z.literal('draft'), text: z.string() }),
   z.object({ type: z.literal('code'), language: z.string().nullable(), code: z.string() }),
   z.object({ type: z.literal('table'), header: z.array(z.string()), rows: z.array(z.array(z.string())) }),
   z.object({ type: z.literal('asset'), id: z.number() }),

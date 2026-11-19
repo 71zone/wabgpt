@@ -134,6 +134,53 @@ test('text and an image keep the order in which the message renders them', () =>
   assert.deepEqual(parse(run(html, chatgptExtractionScript)).blocks, [{ type: 'asset', id: 1 }, { type: 'markdown', text: 'Here it is' }]);
 });
 
+const writingCard = (variant: string, header: string, body: string, copyText: string): string => `<div data-client-defined-widget="writing_block" data-id="58321"><div class="group/writing-block-surface relative" data-oai-writing-block-surface="" data-markdown-copy="rich-block" data-markdown-copy-text="${copyText}" data-testid="chatgpt-writing-block" data-writing-block-variant="${variant}"><div aria-hidden="true"></div><div class="relative z-[1]"><header class="flex">${header}</header><div><div></div><div><div class="relative"><div class="content-mUPWP6" data-markdown-copy-content="true" dir="auto"><div class="editor-jMsqTn writing-block-editor"><div contenteditable="true" aria-label="Start writing" aria-multiline="true" role="textbox" class="ProseMirror">${body}</div></div></div></div></div></div></div></div></div>`;
+const writingHeader = (label: string): string => `<div class="flex"><div class="ms-2 flex"><span class="min-w-0 truncate px-3 py-2 text-tertiary"><span class="text-tertiary">${label}</span></span></div></div><div class="flex"><div class="flex"><div class="flex gap-1"><button type="button" aria-label="Copy" data-state="closed"><svg></svg></button></div></div><button type="button" aria-label="Open editor" data-state="closed"><svg></svg></button></div>`;
+const draftParagraph = (value: string): string => `<p dir="auto"><span>${value}</span></p>`;
+
+test('a writing card becomes its own draft block between the prose around it, without its label or buttons', () => {
+  const draft = draftParagraph("Hey! 😊 We're putting together a dance performance, and I'd love for you to join us!");
+  const reply = `${text('Here is a draft:')}${writingCard('chat_message', writingHeader('Writing'), draft, 'Hey')}${`<p data-d-text-flow="" data-d-component="text"><span data-d-stream-run=""><strong>Tone:</strong></span><span data-d-stream-run=""> Thân thiện, vui vẻ.</span></p>`}`;
+  assert.deepEqual(parse(run(textTurn(reply), chatgptExtractionScript)).blocks, [
+    { type: 'markdown', text: 'Here is a draft:' },
+    { type: 'draft', text: "Hey! 😊 We're putting together a dance performance, and I'd love for you to join us!" },
+    { type: 'markdown', text: '**Tone:** Thân thiện, vui vẻ.' },
+  ]);
+});
+
+test('an email card keeps paragraphs, bold, italics, line breaks and bullet lists as Markdown and leads with its subject', () => {
+  const body = [
+    draftParagraph("Dear [Manager's Name],"),
+    `<p dir="auto"><span>To ensure a smooth </span><strong><span>handover</span></strong><span>, I will:</span></p>`,
+    `<ul data-spread="false"><li><p dir="auto"><span>Finish all </span><em><span>priority</span></em><span> work.</span></p></li><li><p dir="auto"><span>Share updates.</span></p></li></ul>`,
+    `<p dir="auto"><span>Best regards,</span><br><span>[Your Name]</span></p>`,
+  ].join('');
+  const header = `<div class="flex"><div class="min-w-0">Leave Request for Friday</div></div><div class="flex"><button type="button" aria-label="Copy"><svg></svg></button><fieldset class="contents"><button type="button" aria-label="Open email in app"><svg></svg></button><button type="button" aria-label="Send as me@example.com"><svg></svg>Send</button></fieldset></div>`;
+  const reply = `${writingCard('email', header, body, 'copy')}${text('Tone: formal.')}`;
+  assert.deepEqual(parse(run(textTurn(reply), chatgptExtractionScript)).blocks, [
+    { type: 'draft', text: "Subject: Leave Request for Friday\n\nDear [Manager's Name],\n\nTo ensure a smooth **handover**, I will:\n\n- Finish all *priority* work.\n- Share updates.\n\nBest regards,\n[Your Name]" },
+    { type: 'markdown', text: 'Tone: formal.' },
+  ]);
+});
+
+test('a writing card whose editor is empty falls back to the copy text ChatGPT attaches to it, and two cards stay separate drafts', () => {
+  const reply = `${writingCard('chat_message', writingHeader('Writing'), '', 'Only the copy text')}${text('between')}${writingCard('chat_message', writingHeader('Message'), draftParagraph('Second'), 'x')}`;
+  assert.deepEqual(parse(run(textTurn(reply), chatgptExtractionScript)).blocks, [
+    { type: 'draft', text: 'Only the copy text' },
+    { type: 'markdown', text: 'between' },
+    { type: 'draft', text: 'Second' },
+  ]);
+});
+
+test('a code block inside a writing card stays in order between two draft parts', () => {
+  const body = `${draftParagraph('Run this:')}${codeWidget('Bash', staticCode('make'))}${draftParagraph('Done.')}`;
+  assert.deepEqual(parse(run(textTurn(writingCard('chat_message', writingHeader('Writing'), body, 'c')), chatgptExtractionScript)).blocks, [
+    { type: 'draft', text: 'Run this:' },
+    { type: 'code', language: 'bash', code: 'make' },
+    { type: 'draft', text: 'Done.' },
+  ]);
+});
+
 test('an image and the sentence about it live in separate response bodies of one turn; both are read and the turn completes without a Copy button', () => {
   const html = `<main><section data-content-search-turn-key="t"><div><h4 data-conversation-role="user">You</h4><div data-chatgpt-search-message-ids="user-1">Q</div></div><div data-talvt-turn-state="complete"><div><div data-response-body="m1" data-chatgpt-search-message-ids="m1"><div data-testid="generated-image-gallery"><img alt="Generated image 1" src="blob:https://chatgpt.com/a"></div></div></div><div data-chatgpt-search-message-ids="m2"><h4 data-conversation-role="assistant">ChatGPT</h4><div data-response-body="m2"><div data-markdown-text-style="assistant-message"><p>A blue square.</p></div></div></div><button aria-label="Copy image">Copy image</button></div></section></main>`;
   assert.deepEqual(parse(run(html, chatgptExtractionScript)).blocks, [{ type: 'asset', id: 1 }, { type: 'markdown', text: 'A blue square.' }]);
