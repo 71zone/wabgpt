@@ -90,6 +90,8 @@ interface State {
   blockSidebarReads: boolean; blocked: number; blockedClosed: number;
   projects: Set<string>; redirects: Map<string, string>; slugConversations: boolean; driftAfterInspect: string | null; driftOnObserve: string | null;
   sidebar: Sidebar; rich: Rich;
+  /** ChatGPT unmounts a finished turn that is far from the viewport: after `vanishAfterReveals` scrolls to the end of the conversation the turn is gone, and one more scroll brings it back. */
+  virtualization: { vanishAfterReveals: number | null; reveals: number; hidden: boolean };
 }
 interface Fixture { endpoint: string; expire(): void; tabs(): string[]; moveTabs(url: string): void; state: State }
 
@@ -98,6 +100,7 @@ async function withServer(run: (fixture: Fixture) => Promise<void>): Promise<voi
   const state: State = {
     initializations: 0, submissions: 0, disconnectOnSubmit: false, expireAfterSubmit: false, complete: true, initialTurns: 0, reclaimedGroups: 0, chatgptTabsOpened: 0, opened, groupIdsOmitted: false, tabGroupListings: 0,
     navigations: [], waits: [], submittedAt: [], conversations: 0, blockSidebarReads: false, blocked: 0, blockedClosed: 0, projects: new Set([projectA, projectB]), redirects: new Map(), slugConversations: false, driftAfterInspect: null, driftOnObserve: null,
+    virtualization: { vanishAfterReveals: null, reveals: 0, hidden: false },
     sidebar: { projects: [], limit: null, revealed: false, collapsed: false, signedOut: false, hydrateAfter: 0, reads: 0, explorerCount: null, chatMoreClicks: 0, recentsMoreClicks: 0, toggles: 0, signOutOnToggle: false },
     rich: { events: [], uploads: [], staged: 0, uploadPolls: 0, uploadFails: false, menuOpen: false, composerPolls: 0, dropAfterPolls: null, replyText: null, media: false, extraction: null, assets: new Map(), released: [] },
   };
@@ -166,6 +169,10 @@ async function withServer(run: (fixture: Fixture) => Promise<void>): Promise<voi
         if (source.includes('data-wab-asset')) return { value: stageFakeAsset(state.rich, Number(argument)) };
         if (source.includes('arrayBuffer')) return { value: readFakeChunk(state.rich, argument) };
         if (source.includes('__wabAssets')) { state.rich.released.push(Number(argument)); return { value: true }; }
+        if (source.includes('scrollerOf')) {
+          if (state.submissions > 0) { state.virtualization.reveals++; state.virtualization.hidden = state.virtualization.vanishAfterReveals !== null && state.virtualization.reveals <= state.virtualization.vanishAfterReveals; }
+          return { value: { found: !state.virtualization.hidden } };
+        }
         const targetUser = argument;
         if (state.driftOnObserve && state.submissions > 0) { url = state.driftOnObserve; state.driftOnObserve = null; }
         const count = counts.get(url) ?? state.initialTurns;
@@ -174,7 +181,7 @@ async function withServer(run: (fixture: Fixture) => Promise<void>): Promise<voi
         const text = state.rich.replyText ?? 'Completed response';
         const value = { url, users: Math.min(count, 5), assistants: Math.min(state.complete ? count : Math.max(0, count - 1), 5), userId: matched ? userId : null, assistantId: matched && count && state.complete ? `assistant-${count}` : null, text: matched && state.complete && count ? text : '', complete: matched && state.complete, busy: !state.complete && count > 0, error: null, media: state.rich.media };
         if (state.driftAfterInspect) { url = state.driftAfterInspect; state.driftAfterInspect = null; }
-        return { value };
+        return { value: state.virtualization.hidden ? { ...value, userId: null, assistantId: null, text: '', complete: false, busy: false } : value };
       },
       close: async () => { pages.delete(id); },
     };
@@ -962,3 +969,45 @@ for (const [name, extraction] of [
     });
   });
 }
+
+test('a finished reply that ChatGPT unmounts from a long conversation is scrolled back into view and delivered, not abandoned', { timeout: 15_000 }, async () => {
+  await withServer(async fixture => {
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: () => {}, media });
+    const state = fixture.state;
+    state.complete = false;
+    state.virtualization.vanishAfterReveals = 1;
+    try {
+      await browser.start();
+      const reply = await browser.reply({
+        conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'A question after a very long earlier reply', attachments: [],
+        onConversation: async () => {}, onSubmitted: async () => { state.complete = true; },
+      });
+      assert.equal(reply.text, 'Completed response');
+      assert.equal(state.submissions, 1);
+      // Once when the message first appeared, once to recover it after it vanished, once before the reply's structure was read.
+      assert.equal(state.virtualization.reveals, 3);
+      assert.equal(state.virtualization.hidden, false);
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});
+
+test('a reply whose structured read lost most of its text is delivered as its plain text and keeps the files it came with', async () => {
+  await withServer(async fixture => {
+    const logs: string[] = [];
+    const browser = createChatGPT({ endpoint: fixture.endpoint, logger: message => { logs.push(message); }, media });
+    const rich = fixture.state.rich;
+    const reply = 'A long answer with several sections. '.repeat(30);
+    rich.replyText = reply; rich.media = true;
+    rich.assets.set(1, { mime: 'text/plain', name: 'notes.txt', bytes: Buffer.from('notes') });
+    rich.extraction = { url: 'https://chatgpt.com/c/existing', text: reply, blocks: [{ type: 'markdown', text: 'Only a fragment survived' }, { type: 'asset', id: 1 }], assets: [{ id: 1, kind: 'file', name: 'notes.txt' }] };
+    try {
+      await browser.start();
+      const result = await browser.reply({ conversationRef: 'https://chatgpt.com/c/existing', projectRef: null, text: 'Hello', ...quiet });
+      const blocks = result.blocks ?? [];
+      assert.deepEqual(blocks[0], { type: 'markdown', text: reply });
+      assert.equal(attachmentOf(blocks[1]).fileName, 'notes.txt');
+      assert.equal(blocks.length, 2);
+      assert.ok(logs.some(line => /lost content/.test(line)));
+    } finally { await browser.stop().catch(() => undefined); }
+  });
+});

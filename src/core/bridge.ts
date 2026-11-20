@@ -11,6 +11,14 @@ const MAX_RETRY_DELAY_MS = 30_000;
 
 function describe(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
+/** One short line for the contact: internal advice after the first sentence ("Inspect the saved conversation...") means nothing to them. */
+function failureNotice(assistantName: string, replied: boolean, detail: string): string {
+  const reason = (detail.match(/^.*?[.!?](?=\s|$)/s)?.[0] ?? detail).replace(/\s+/g, ' ').trim().replace(/[.!?]+$/, '').slice(0, 160);
+  return replied
+    ? `${assistantName} replied, but I could not deliver it: ${reason}. Please ask again.`
+    : `${assistantName} did not return a reply: ${reason}. Please ask again.`;
+}
+
 export class Bridge {
   private queue: Promise<void> = Promise.resolve();
   private armed = false;
@@ -41,6 +49,7 @@ export class Bridge {
     if (!this.armed || !route?.enabled) { await this.store.finish(key, contactId, 'failed'); return; }
     const started = performance.now();
     let accepted = false;
+    let replied = false;
     try {
       this.logger(`Forwarding a message from ${route.name}.`);
       const response = await this.retryUnsent(route.name, assistantName, () => this.assistant.reply({
@@ -65,6 +74,7 @@ export class Bridge {
           void receipt.then(() => this.pendingReceipts.delete(receipt), () => this.pendingReceipts.delete(receipt));
         },
       }), () => this.assistant.start());
+      replied = true;
       this.logger(`${assistantName} reply ready for ${route.name} after ${Math.round(performance.now() - started)}ms.`);
       await this.store.conversation(contactId, response.conversationRef);
       const blocks = response.blocks ?? [{ type: 'markdown' as const, text: response.text }];
@@ -81,11 +91,21 @@ export class Bridge {
       if (accepted) {
         // The prompt is already in the assistant, so replaying it could duplicate it, but the session itself is healthy: later messages still flow.
         this.logger(`No reply was delivered to ${route.name}: ${detail} The ${assistantName} conversation may still hold the answer; the message was not replayed and ${route.name} stays enabled.`);
+        await this.tellContact(contactId, route.name, failureNotice(assistantName, replied, detail));
         return;
       }
       await this.store.pause(contactId, detail);
       this.logger(`Paused ${route.name}: ${detail} Inspect ${channelName} and ${assistantName} before enabling again. No automatic replay.`);
     }
+  }
+  /**
+   * Tells the contact, once, that their message got no answer. Not retried (a retry loop would repeat the notice) and never for a deliberate pause. Its own failure
+   * is only logged: the original failure is already recorded and later messages must still flow.
+   */
+  private async tellContact(contactId: string, name: string, text: string): Promise<void> {
+    if (!this.armed || !this.store.route(contactId)?.enabled) return;
+    try { await this.channel.sendReply(contactId, [{ type: 'markdown', text }]); }
+    catch (error) { this.logger(`Could not tell ${name} that no reply is coming: ${describe(error)}`); }
   }
   /**
    * Runs `operation`, repeating it while it fails with NotSentError (the provider provably never got the message), backing off up to 30s and

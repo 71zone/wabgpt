@@ -35,6 +35,10 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
   const TICK = String.fromCharCode(96);
   const SKIP = '[hidden],[aria-hidden="true"],[data-markdown-copy="exclude"],style,script,svg,button:not([aria-label="Download file"]),aside,[role="alert"]';
   const HEADINGS = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
+  // Containers a browser lays out as separate lines. Without this, the rows of an unknown widget (a form's labelled fields, a card's rows) run together into one paragraph.
+  const LINES = /^(div|section|article|form|fieldset|label|figure|figcaption|dl|dt|dd|details|summary|header|footer|nav|address)$/;
+  const BREAK = String.fromCharCode(1);
+  const BREAKS = new RegExp(' *' + BREAK + '[ ' + BREAK + ']*', 'g');
   const CODE = '[data-client-defined-widget="code_block"],[data-code-block],pre';
   const CARD = '[data-client-defined-widget="writing_block"],[data-testid="chatgpt-writing-block"],[data-oai-writing-block-surface]';
   const BLOCKS = 'p,ul,ol,table,blockquote,hr,' + HEADINGS.join(',') + ',' + CODE + ',' + CARD + ',[data-testid="generated-image-gallery"],button[aria-label="Download file"],img';
@@ -79,9 +83,13 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
       if (!href) return text;
       return text && text !== href ? '[' + text + '](' + href + ')' : href;
     }
+    if (LINES.test(tag)) {
+      const body = inner();
+      return body.trim() ? BREAK + body + BREAK : '';
+    }
     return inner();
   };
-  const paragraph = (nodes, marks) => nodes.map(node => inline(node, marks)).join('').replace(/ *\n */g, '\n').trim();
+  const paragraph = (nodes, marks) => nodes.map(node => inline(node, marks)).join('').replace(BREAKS, '\n').replace(/ *\n */g, '\n').trim();
 
   const plain = (node) => {
     if (node.nodeType === 3) return collapse(node.textContent);
@@ -184,6 +192,7 @@ export const chatgptExtractionScript = String.raw`(targetUserId) => {
       if (node.nodeType !== 1 || node.matches(SKIP)) continue;
       if (node.matches(BLOCKS)) { endRun(); out.push({ el: node }); }
       else if (hasBlock(node)) { endRun(); out.push(...itemsOf(node)); }
+      else if (LINES.test(tagOf(node))) { endRun(); run.push(node); endRun(); }
       else run.push(node);
     }
     endRun();

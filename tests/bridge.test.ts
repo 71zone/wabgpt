@@ -38,20 +38,91 @@ test('routes distinct contacts to persistent conversations and suppresses redeli
   });
 });
 
-test('a failure after the prompt was accepted never replays it but keeps the contact enabled for later messages', async () => {
+test('a failure after the prompt was accepted never replays it, keeps the contact enabled and tells the contact once per message', async () => {
   await fixture(async store => {
     await store.enable(alice);
     let calls = 0;
     const assistant = fakeAssistant({ reply: async input => {
       calls++; await input.onConversation('https://chatgpt.com/c/retained'); await input.onSubmitted(); throw new Error('Response timed out after submission');
     } });
-    const channel = fakeChannel({ sendText: async () => { assert.fail('Must not send on failed generation'); } });
+    const notices: string[] = [];
+    const channel = fakeChannel({ sendText: async (_id, text) => { notices.push(text); } });
     const bridge = bridgeOf(store, assistant, channel); bridge.arm();
     bridge.receive(incoming('a')); bridge.receive(incoming('b')); await bridge.idle();
     assert.equal(calls, 2);
     assert.equal(store.route(alice.id)?.enabled, true);
     assert.equal(store.route(alice.id)?.conversationRef, 'https://chatgpt.com/c/retained');
+    assert.deepEqual(notices, Array(2).fill('ChatGPT did not return a reply: Response timed out after submission. Please ask again.'));
     bridge.receive(incoming('a')); await bridge.idle(); assert.equal(calls, 2);
+    assert.equal(notices.length, 2);
+  });
+});
+
+test('when the reply was read but could not be delivered the contact is told that, with the first sentence of the reason and none of the operator advice', async () => {
+  await fixture(async store => {
+    await store.enable(alice);
+    const assistant = fakeAssistant({ reply: async input => {
+      await input.onConversation('https://chatgpt.com/c/ready'); await input.onSubmitted();
+      return { conversationRef: 'https://chatgpt.com/c/ready', text: 'The answer' };
+    } });
+    const sends: string[] = [];
+    const channel = fakeChannel({ sendText: async (_id, text) => {
+      sends.push(text);
+      if (sends.length === 1) throw new Error('WhatsApp delivered 1 of 3 messages before failing: socket closed. Inspect WhatsApp before enabling again.');
+    } });
+    const logs: string[] = [];
+    const bridge = bridgeOf(store, assistant, channel, text => logs.push(text)); bridge.arm();
+    bridge.receive(incoming('a')); await bridge.idle();
+    assert.deepEqual(sends, ['The answer', 'ChatGPT replied, but I could not deliver it: WhatsApp delivered 1 of 3 messages before failing: socket closed. Please ask again.']);
+    assert.equal(store.route(alice.id)?.enabled, true);
+    assert.ok(logs.some(line => line.startsWith('No reply was delivered to Alice: WhatsApp delivered 1 of 3 messages')));
+  });
+});
+
+test('a notice that cannot be sent is only logged: it is not retried, does not stop later messages and the failed message is not replayed', async () => {
+  await fixture(async store => {
+    await store.enable(alice);
+    let calls = 0, sends = 0;
+    const assistant = fakeAssistant({ reply: async input => {
+      calls++; await input.onConversation('https://chatgpt.com/c/quiet'); await input.onSubmitted();
+      if (calls === 1) throw new Error('ChatGPT response timed out after submission.');
+      return { conversationRef: 'https://chatgpt.com/c/quiet', text: 'Second answer' };
+    } });
+    const delivered: string[] = [];
+    const channel = fakeChannel({ sendText: async (_id, text) => {
+      if (++sends === 1) throw new NotSentError('WhatsApp is not connected');
+      delivered.push(text);
+    } });
+    const logs: string[] = [];
+    const bridge = bridgeOf(store, assistant, channel, text => logs.push(text)); bridge.arm();
+    bridge.receive(incoming('a')); bridge.receive(incoming('b')); await bridge.idle();
+    assert.equal(sends, 2, 'one failed notice attempt for the first message, one delivery for the second');
+    assert.deepEqual(delivered, ['Second answer']);
+    assert.equal(calls, 2);
+    assert.ok(logs.some(line => line === 'Could not tell Alice that no reply is coming: WhatsApp is not connected'));
+    assert.equal(store.route(alice.id)?.enabled, true);
+  });
+});
+
+test('nothing is sent to the contact when the failure is a deliberate pause or when the message never reached the assistant', async () => {
+  await fixture(async store => {
+    await store.enable(alice); await store.enable(bob);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const assistant = fakeAssistant({ reply: async input => {
+      if (input.text === 'Question rejected') throw new Error('Submission rejected');
+      await input.onConversation('https://chatgpt.com/c/paused'); await input.onSubmitted();
+      entered.resolve(); await release.promise;
+      return { conversationRef: 'https://chatgpt.com/c/paused', text: 'Do not deliver' };
+    } });
+    const channel = fakeChannel({ sendText: async () => { assert.fail('Neither a pause nor a rejected submission may message the contact'); } });
+    const bridge = bridgeOf(store, assistant, channel); bridge.arm();
+    bridge.receive(incoming('paused')); await entered.promise;
+    bridge.disarm(); release.resolve(); await bridge.idle();
+    bridge.arm();
+    bridge.receive(incoming('rejected', bob)); await bridge.idle();
+    assert.equal(store.route(alice.id)?.enabled, true);
+    assert.equal(store.route(bob.id)?.enabled, false);
   });
 });
 

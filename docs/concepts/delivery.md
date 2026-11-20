@@ -22,7 +22,7 @@ After the new prompt appears in its saved ChatGPT conversation, the bridge marks
 
 ## Reading the reply
 
-The response reader matches stable user and assistant message IDs within the same completed turn, then extracts only the assistant message body. It does not depend on rendered message counts, which can shrink as ChatGPT virtualizes older turns. It does not send headings or action labels. Browser readiness alone does not prove response extraction still matches the current ChatGPT UI. Replies longer than 60,000 characters are not sent; read them in the saved ChatGPT conversation.
+The response reader matches stable user and assistant message IDs within the same completed turn, then extracts only the assistant message body. It does not depend on rendered message counts, which can shrink as ChatGPT virtualizes older turns. ChatGPT also removes a finished turn from the page when it is far from the viewport, which happens to the newest turn in a long conversation (a tab that was just loaded sits at the top). The reader therefore scrolls the conversation to its end after submitting, whenever the submitted turn is missing, and before reading the reply; without that, a long earlier reply made every later reply unreadable. It does not send headings or action labels. Browser readiness alone does not prove response extraction still matches the current ChatGPT UI. Replies longer than 60,000 characters are not sent; read them in the saved ChatGPT conversation.
 
 ## Reconnects and uncertain acceptance
 
@@ -44,7 +44,7 @@ The bridge checks the MCP connection before submitting each prompt and when you 
 | Table | Its own message with an aligned monospace grid when it fits a phone (at most 40 characters wide and 30 rows); otherwise one record per row. Tables with more than 8 rows or that do not fit also arrive as `table.csv`, which opens in Excel or Sheets |
 | Generated image or file | Native WhatsApp image or document, in its position in the reply |
 
-If extracting the rich content fails, the plain text of the reply is sent instead, so a finished reply is never lost. Files in transit live in `media/` under the data directory and are deleted after 24 hours.
+Containers the reader does not recognize (an input form, a card of rows) are read as separate lines of text rather than skipped or run together. If extracting the rich content fails, or the blocks kept clearly less text than the reply has (70% of its letters and digits), the plain text of the reply is sent instead and any generated files stay attached, so a finished reply is never lost. Files in transit live in `media/` under the data directory and are deleted after 24 hours.
 
 ## Self-healing and errors
 
@@ -53,7 +53,7 @@ The bridge repairs itself rather than waiting for you to press R or re-enable a 
 - **Not yet sent:** if ChatGPT is not ready before the prompt is submitted (BrowserOS down, tab or composer missing, conversation still generating), or WhatsApp is offline when the reply is ready, the same message is retried with backoff up to 30 seconds for up to 30 minutes. Between attempts the bridge reconnects BrowserOS. This is safe because the provider provably never received the message.
 - **Slow replies:** the bridge keeps waiting while ChatGPT is generating or the text is changing. It gives up only after 5 minutes without progress or 60 minutes in total, and retries lost BrowserOS connections the whole time.
 - **Stopped forwarding:** while the saved running flag is on, a watchdog resumes forwarding whenever it becomes disarmed (BrowserOS unreachable at launch, channel failure, an unexpected bridge error), with backoff from 15 seconds to 5 minutes. A logged-out WhatsApp device still needs a QR scan.
-- **After acceptance:** if ChatGPT accepted the prompt but no reply could be read or sent, the prompt is never replayed, because that could duplicate it. The session stays enabled and later messages flow. The answer may still be in the saved ChatGPT conversation.
+- **After acceptance:** if ChatGPT accepted the prompt but no reply could be read or sent, the prompt is never replayed, because that could duplicate it. The session stays enabled and later messages flow. The answer may still be in the saved ChatGPT conversation. The contact gets one short WhatsApp line saying either that ChatGPT did not return a reply or that it replied but the reply could not be delivered, with the first sentence of the reason and a request to ask again. That notice is sent once, never retried, and not sent when you paused forwarding; if it cannot be sent either, only Activity shows it.
 - **Unknown failures before acceptance:** the session pauses, and you inspect both conversations before enabling it again. Interrupted deliveries are quarantined on restart. The bridge cannot promise exactly-once delivery across two remote services.
 
 Pausing prevents any pending WhatsApp reply from being sent but cannot retract a prompt already submitted to ChatGPT. Quitting disarms forwarding and waits for an in-progress browser operation to finish before closing.

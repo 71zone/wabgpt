@@ -6,8 +6,9 @@ import { parseLocalMcpEndpoint } from '../../infrastructure/loopback.js';
 import type { MediaStore } from '../../infrastructure/media.js';
 import { isExpiredSession, listPagesPrelude, openMcp, reclaimTabGroup, runScript } from '../browseros/mcp.js';
 import { resolveBlocks } from './assets.js';
-import { chatgptInspectionScript, composerAttachmentsScript, composerName, composerReadyScript, settleScript, submitScript, uploadScript } from './dom.js';
+import { chatgptInspectionScript, composerAttachmentsScript, composerName, composerReadyScript, revealLatestTurnScript, settleScript, submitScript, uploadScript } from './dom.js';
 import { chatgptExtractionScript, extraction } from './extract.js';
+import { lostContent } from './coverage.js';
 import { SingleFlight } from '../../core/single-flight.js';
 import { readProjectCatalog } from './projects.js';
 import { chatgptReferences, destinationPathPattern, isConversationPage, isDestination, normalizeConversationUrl, normalizeProjectUrl, type Destination } from './references.js';
@@ -15,6 +16,7 @@ import { chatgptReferences, destinationPathPattern, isConversationPage, isDestin
 const pageResult = z.object({ pageId: z.number(), ready: z.boolean(), groupId: z.string() });
 const inspection = z.object({ url: z.string(), userId: z.string().nullable(), assistantId: z.string().nullable(), text: z.string(), complete: z.boolean(), busy: z.boolean(), error: z.string().nullable(), media: z.boolean() });
 const composerState = z.object({ tiles: z.number(), uploading: z.number(), error: z.string().nullable() });
+const revealState = z.object({ found: z.boolean() });
 const home = 'https://chatgpt.com/';
 /** Upper bound for closing the catalog's scratch tab after the read ended or was cancelled. */
 const scratchCleanupMs = 5000;
@@ -39,6 +41,7 @@ export function createChatGPT(options: { endpoint: string; logger: Logger; media
   let session: string | undefined;
   let currentUrl: string | null = null;
   let working = false;
+  let lastRevealFailure = '';
   const catalog = new SingleFlight<Project[]>();
 
   async function run(code: string): Promise<unknown> {
@@ -109,14 +112,36 @@ export function createChatGPT(options: { endpoint: string; logger: Logger; media
       throw error;
     }
   }
+  /**
+   * Scrolls the conversation to its end so ChatGPT mounts the newest turn, or the turn of `targetUserId`. ChatGPT drops turns that are far from the
+   * viewport, including a finished reply in a tab that sits at the top of a long conversation. Best effort: the next inspection reports a real failure.
+   */
+  async function reveal(targetUserId: string | null): Promise<boolean> {
+    if (pageId === null) return false;
+    try {
+      const value = await run(`const result = await browser.page(${JSON.stringify(pageId)}).evaluateInPage(${revealLatestTurnScript},${JSON.stringify(targetUserId)}); return result.value;`);
+      return revealState.parse(value).found;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (reason !== lastRevealFailure) options.logger(`Could not scroll ChatGPT to its newest message (${reason}).`);
+      lastRevealFailure = reason;
+      return false;
+    }
+  }
   /** Display-ordered blocks of the completed reply; any failure to read its structure falls back to the plain text so a finished reply is never lost. */
   async function readBlocks(text: string, targetUserId: string): Promise<ReplyBlock[]> {
     const plain: ReplyBlock[] = text.trim() ? [{ type: 'markdown', text }] : [];
     if (pageId === null) return plain;
     try {
+      await reveal(targetUserId);
       const value = await run(`const result = await browser.page(${pageId}).evaluateInPage(${chatgptExtractionScript},${JSON.stringify(targetUserId)}); return result.value;`);
       const blocks = await resolveBlocks(extraction.parse(value), { run, pageId, media: options.media, logger: options.logger });
-      return blocks.length > 0 ? blocks : plain;
+      if (blocks.length === 0) return plain;
+      if (lostContent(blocks, text)) {
+        options.logger("ChatGPT's reply lost content when its structure was read; delivering its plain text.");
+        return [...plain, ...blocks.filter(block => block.type === 'attachment')];
+      }
+      return blocks;
     } catch (error) {
       options.logger(`Could not read the structure of ChatGPT's reply (${error instanceof Error ? error.message : String(error)}); delivering its plain text.`);
       return plain;
@@ -224,6 +249,8 @@ export function createChatGPT(options: { endpoint: string; logger: Logger; media
           let navigated = false;
           if (pageId === null) { await openPage(target); navigated = true; }
           else if (!conversationUrl || currentUrl !== target) { await navigate(); navigated = true; }
+          // A freshly loaded long conversation starts at its top, where the newest turn is not mounted: bring it into view so the first read sees the real latest turn.
+          if (conversationUrl) await reveal(null);
           let before = await inspect();
           if (!navigated && !isDestination(before.url, destination)) { await navigate(); before = await inspect(); }
           if (!isDestination(before.url, destination)) throw new Error(failure);
@@ -257,7 +284,9 @@ export function createChatGPT(options: { endpoint: string; logger: Logger; media
         let lastProgress = startedAt;
         let lastText = '';
         let lastFailure: unknown;
+        let lastSeen = '';
         let failures = 0;
+        let pinned = false;
         while (Date.now() - startedAt < MAX_WAIT_MS) {
           let observed;
           try { observed = await inspect(submittedUserId); failures = 0; }
@@ -272,17 +301,32 @@ export function createChatGPT(options: { endpoint: string; logger: Logger; media
           await remember(observed.url);
           if (observed.error) throw new Error(`ChatGPT: ${observed.error}`);
           if (!submittedUserId && observed.userId && observed.userId !== before.userId) submittedUserId = observed.userId;
-          if (saved && submittedUserId && observed.userId === submittedUserId && !acknowledged) {
+          const present = submittedUserId !== null && observed.userId === submittedUserId;
+          if (saved && present && !acknowledged) {
             acknowledged = true;
             await input.onSubmitted();
           }
-          if (saved && submittedUserId && observed.userId === submittedUserId && observed.assistantId && observed.complete && !observed.busy && (observed.text.trim() || observed.media)) return { conversationRef: saved, text: observed.text, blocks: await readBlocks(observed.text, submittedUserId) };
+          if (saved && submittedUserId && present && observed.assistantId && observed.complete && !observed.busy && (observed.text.trim() || observed.media)) return { conversationRef: saved, text: observed.text, blocks: await readBlocks(observed.text, submittedUserId) };
           if (observed.busy || observed.text !== lastText) { lastProgress = Date.now(); lastText = observed.text; }
           if (Date.now() - lastProgress >= IDLE_LIMIT_MS) break;
+          // ChatGPT drops a finished turn that is far from the viewport (or leaves an empty shell of it), and the reply can no longer be read. Scroll to the
+          // newest turn once the message is on the page so it stays mounted, and again whenever it goes missing. A message that never shows up at all gets
+          // one scroll too, since its turn may simply not be mounted yet.
+          const hollow = present && observed.complete && !observed.busy && !observed.text.trim() && !observed.media;
+          lastSeen = !present ? 'the submitted message is not on the ChatGPT page' : hollow ? 'the reply has no text on the page' : !observed.complete ? 'ChatGPT has not marked the reply complete' : '';
+          const missing = submittedUserId !== null && (!present || hollow);
+          const unseen = submittedUserId === null && Date.now() - startedAt >= 5000;
+          if (missing || (!pinned && (submittedUserId !== null || unseen))) {
+            pinned = true;
+            await reveal(submittedUserId);
+            await setTimeout(250);
+            continue;
+          }
           await setTimeout(1000);
         }
         const reason = lastFailure instanceof Error ? ` Last error: ${lastFailure.message}` : '';
-        throw new Error(`ChatGPT response timed out after submission (no progress for ${Math.round(IDLE_LIMIT_MS / 60000)} minutes or over ${Math.round(MAX_WAIT_MS / 60000)} minutes total).${reason} Inspect the saved conversation; do not resend automatically.`);
+        const seen = lastSeen ? ` Last seen: ${lastSeen}.` : '';
+        throw new Error(`ChatGPT response timed out after submission (no progress for ${Math.round(IDLE_LIMIT_MS / 60000)} minutes or over ${Math.round(MAX_WAIT_MS / 60000)} minutes total).${reason}${seen} Inspect the saved conversation; do not resend automatically.`);
       } finally { working = false; }
     },
   };

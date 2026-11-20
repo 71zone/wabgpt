@@ -3,11 +3,15 @@ export const composerName = /Ask|Message|ChatGPT|New chat in/i;
 
 /**
  * Page-script prelude shared by the inspection and extraction scripts: finds the newest turn, or the turn of `targetUserId`, and binds
- * `userId`, `assistantId`, `turn` and `holder` (the container of the turn's last assistant message, null when there is none).
+ * `main`, `userId`, `assistantId`, `turn` and `holder` (the container of the turn's last assistant message, null when there is none).
  * A text reply carries the message id on `holder` itself; an image-only reply carries it on the `[data-response-body]` inside `holder`.
+ * ChatGPT's app shell keeps the pages a tab navigated through mounted but inactive, each with its own `<main>`; the active page's one is read.
+ * Only turns near the viewport are mounted (ChatGPT virtualizes the rest), so a turn far below a long earlier reply can be absent from the page:
+ * revealLatestTurnScript brings it back.
  */
 export const locateAssistant = String.raw`
-  const main = document.querySelector('main') || document.body;
+  const mains = Array.from(document.querySelectorAll('main'));
+  const main = mains.find(node => node.closest('[data-app-shell-active-page="true"]')) || mains.at(-1) || document.body;
   const users = Array.from(main.querySelectorAll('[data-conversation-role="user"]'));
   const user = targetUserId
     ? users.find(node => node.parentElement?.querySelector('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids')?.split(/\s+/).includes(targetUserId))
@@ -34,6 +38,37 @@ export const chatgptInspectionScript = String.raw`(targetUserId) => {
   const complete = turn?.getAttribute('data-talvt-turn-state') === 'complete' && (!!turn.querySelector('button[aria-label="Copy"]') || media);
   const error = main.querySelector('[role="alert"]')?.textContent?.trim() || null;
   return {url:location.href,userId,assistantId,text,complete,busy,error,media};
+}`;
+
+/**
+ * Page script (async) that scrolls the conversation to its end until the newest turn, or the turn of `targetUserId`, is mounted, and returns `{ found }`.
+ * ChatGPT mounts only the turns around the viewport. A tab that was just navigated sits at the top of the conversation, so after a long earlier reply the
+ * turn being generated is mounted while it streams but is dropped from the page the moment it completes: inspection then finds no turn, never sees it
+ * complete and the reply is lost. Scrolling mounts turns, which changes the scroll height, so it repeats until the height stops changing.
+ */
+export const revealLatestTurnScript = String.raw`async (targetUserId) => {
+  const locate = () => {
+    ${locateAssistant}
+    return { main, user };
+  };
+  const scrollerOf = (start) => {
+    for (let el = start; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      const overflow = typeof getComputedStyle === 'function' ? getComputedStyle(el).overflowY : '';
+      if (/auto|scroll|overlay/.test(overflow) && el.scrollHeight > el.clientHeight + 1) return el;
+    }
+    return document.scrollingElement || document.documentElement;
+  };
+  let settled = -1;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const { main } = locate();
+    const scroller = scrollerOf(main.querySelector('[data-content-search-turn-key]') || main);
+    scroller.scrollTop = scroller.scrollHeight;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const height = scroller.scrollHeight;
+    if (locate().user && height === settled) return { found: true };
+    settled = height;
+  }
+  return { found: !!locate().user };
 }`;
 
 /**
